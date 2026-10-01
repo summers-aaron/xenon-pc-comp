@@ -11,6 +11,8 @@
 #   --instance N   system link on one PC: instance N (1..16) uses IP 127.0.0.<N+1>,
 #                  gamertag PlayerN and its own saves/caches (games/halo3/instances/N);
 #                  several instances may run at once
+#   --live [URL]   sign in to the Xbox Live stand-in (halo3-live-phoenix), default
+#                  http://127.0.0.1:36080; enables matchmaking
 #   --name NAME    gamertag; across PCs each system link player needs its own
 #                  (without --instance the game uses this PC's LAN address)
 #   --zt           system link over ZeroTier: advertise this PC's ZeroTier IPv4
@@ -43,6 +45,11 @@ while [ $# -gt 0 ]; do
     --instance)
       shift
       instance=$1
+      ;;
+    --live)
+      url=http://127.0.0.1:36080
+      if [ $# -gt 1 ] && [[ $2 == http://* ]]; then shift; url=$1; fi
+      extra+=(--live_server="$url")
       ;;
     --name)
       shift

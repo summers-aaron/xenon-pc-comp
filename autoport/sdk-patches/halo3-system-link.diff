@@ -10148,6 +10148,33 @@ index 0000000..584f748
 +}  // namespace rex::graphics
 +
 +#endif  // REX_GRAPHICS_XENOS_ZPD_REPORT_H_
+diff --git a/include/rex/kernel/xam/apps/xlivebase_app.h b/include/rex/kernel/xam/apps/xlivebase_app.h
+index 4cd55a8..4c61d7f 100644
+--- a/include/rex/kernel/xam/apps/xlivebase_app.h
++++ b/include/rex/kernel/xam/apps/xlivebase_app.h
+@@ -24,6 +24,22 @@ class XLiveBaseApp : public system::xam::App {
+ 
+   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                 uint32_t buffer_length) override;
++  X_HRESULT DispatchMessageAsync(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
++                                 uint32_t* extended_error) override;
++
++ private:
++  X_HRESULT Dispatch(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
++                     uint32_t* extended_error);
++  X_HRESULT DispatchTask(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
++                     uint32_t* extended_error);
++  // Xbox Live storage (live_server only); see xlivebase_app.cpp.
++  X_HRESULT XStorageBuildServerPath(uint32_t buffer_ptr);
++  X_HRESULT XStorageDownloadToMemory(uint32_t buffer_ptr, uint32_t* extended_error);
++  X_HRESULT XStorageUploadFromMemory(uint32_t buffer_ptr);
++  X_HRESULT XStorageEnumerate(uint32_t buffer_ptr, uint32_t* extended_error);
++  X_HRESULT XStorageDelete(uint32_t buffer_ptr);
++  X_HRESULT XStringVerify(uint32_t buffer_ptr);
++  X_HRESULT XOnlineGetTaskProgress(uint32_t buffer_ptr);
+ };
+ 
+ }  // namespace apps
 diff --git a/include/rex/math.h b/include/rex/math.h
 index ab7960f..1a6623f 100644
 --- a/include/rex/math.h
@@ -10304,6 +10331,109 @@ index ab7960f..1a6623f 100644
 +}  // namespace divisors
 +
  }  // namespace rex
+diff --git a/include/rex/system/xam/app_manager.h b/include/rex/system/xam/app_manager.h
+index 84be3e4..4007028 100644
+--- a/include/rex/system/xam/app_manager.h
++++ b/include/rex/system/xam/app_manager.h
+@@ -37,6 +37,14 @@ class App {
+   virtual X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                         uint32_t buffer_length) = 0;
+ 
++  // XMsgStartIORequest: like DispatchMessageSync, but an app may also set the
++  // overlapped extended error (defaults to the result).
++  virtual X_HRESULT DispatchMessageAsync(uint32_t message, uint32_t buffer_ptr,
++                                         uint32_t buffer_length, uint32_t* extended_error) {
++    (void)extended_error;
++    return DispatchMessageSync(message, buffer_ptr, buffer_length);
++  }
++
+   virtual ~App() = default;
+ 
+  protected:
+@@ -54,7 +62,7 @@ class AppManager {
+   X_HRESULT DispatchMessageSync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+                                 uint32_t buffer_length);
+   X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+-                                 uint32_t buffer_length);
++                                 uint32_t buffer_length, uint32_t* extended_error = nullptr);
+ 
+  private:
+   std::vector<std::unique_ptr<App>> apps_;
+diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
+index ec37017..c5eda3f 100644
+--- a/include/rex/system/xam/user_profile.h
++++ b/include/rex/system/xam/user_profile.h
+@@ -218,7 +218,8 @@ class UserProfile {
+ 
+   uint64_t xuid() const { return xuid_; }
+   std::string name() const { return name_; }
+-  uint32_t signin_state() const { return 1; }
++  // 1: signed in locally; 2: signed in to Xbox Live (live_server set).
++  uint32_t signin_state() const;
+   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+ 
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+diff --git a/include/rex/system/xlive.h b/include/rex/system/xlive.h
+new file mode 100644
+index 0000000..bf08916
+--- /dev/null
++++ b/include/rex/system/xlive.h
+@@ -0,0 +1,55 @@
++/**
++ * @file        xlive.h
++ * @brief       Client for an Xbox Live stand-in server (halo3-live-phoenix).
++ *
++ * Enabled by the live_server cvar (e.g. "http://127.0.0.1:36080"). When set,
++ * the signed-in profile is reported as signed in to Xbox Live, XAM storage,
++ * title-server (LSP) and XGI session requests are served by the server, and
++ * peers connect directly with the system link networking (xsocket.h).
++ * Protocol: docs/design.md in halo3-live-phoenix.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace rex::system::xlive {
++
++// True when live_server is set.
++bool Enabled();
++
++struct HttpResponse {
++  int status = 0;  // 0: no response (connection failed / timed out)
++  std::string body;
++  bool ok() const { return status >= 200 && status < 300; }
++};
++
++// Blocking HTTP/1.1 request to live_server. path starts with '/'.
++HttpResponse Request(const std::string& method, const std::string& path,
++                     const std::string& body = {},
++                     const std::string& content_type = "application/json");
++
++// The server's IPv4 address (host byte order), resolved from live_server.
++uint32_t ServerAddress();
++// The server's TCP port (from live_server; 80 when not given).
++uint16_t ServerPort();
++
++// Starts the player registration heartbeat (idempotent).
++void StartPresence(uint64_t xuid, const std::string& gamertag);
++
++// Hex helpers matching the server's conventions.
++std::string Hex64(uint64_t v);
++std::string Hex32(uint32_t v);
++std::optional<uint64_t> ParseHex64(const std::string& s);
++
++// This machine's identity (derived from the system link address).
++uint64_t MachineId();
++std::string MacAddressHex();
++
++std::string Base64Encode(const uint8_t* data, size_t size);
++std::vector<uint8_t> Base64Decode(const std::string& text);
++
++}  // namespace rex::system::xlive
 diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
 index 0a43f07..c726ed6 100644
 --- a/include/rex/system/xobject.h
@@ -10321,10 +10451,10 @@ index 0a43f07..c726ed6 100644
                                               int32_t as_type = -1);
    template <typename T>
 diff --git a/include/rex/system/xsocket.h b/include/rex/system/xsocket.h
-index a1b4443..87bf2ca 100644
+index a1b4443..478f40d 100644
 --- a/include/rex/system/xsocket.h
 +++ b/include/rex/system/xsocket.h
-@@ -67,6 +67,36 @@ struct N_XSOCKADDR_IN {
+@@ -67,6 +67,41 @@ struct N_XSOCKADDR_IN {
    char x_sin_zero[8];
  };
  
@@ -10351,6 +10481,11 @@ index a1b4443..87bf2ca 100644
 +uint32_t SecureFromIp(uint32_t ip, bool create);  // 0 if unknown and !create
 +bool IpFromSecure(uint32_t secure, uint32_t* ip);
 +void ForgetSecure(uint32_t secure);
++// Secure addresses XNetServerToInAddr handed out for the title server
++// (live_server). The server takes every service on one port, so TCP connects
++// to them go to live_server's port whatever guest port the title uses.
++void MarkTitleServer(uint32_t secure);
++bool IsTitleServer(uint32_t secure);
 +inline bool IsSecure(uint32_t addr) {
 +  return addr && (addr >> 24) == 0;
 +}
@@ -10361,7 +10496,7 @@ index a1b4443..87bf2ca 100644
  class XSocket : public XObject {
   public:
    static const XObject::Type kObjectType = XObject::Type::Socket;
-@@ -115,6 +145,9 @@ class XSocket : public XObject {
+@@ -115,6 +150,9 @@ class XSocket : public XObject {
                 uint32_t* from_len);
    int SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* to, uint32_t to_len);
  
@@ -10371,7 +10506,7 @@ index a1b4443..87bf2ca 100644
    struct packet {
      // These values are in network byte order.
      rex::be<uint16_t> src_port;
-@@ -141,6 +174,9 @@ class XSocket : public XObject {
+@@ -141,6 +179,9 @@ class XSocket : public XObject {
  
    bool broadcast_socket_ = false;
  
@@ -269452,6 +269587,18 @@ index ced4721..00ca4b5 100644
 +}
  }  // namespace xenos
  }  // namespace rex::graphics
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 984b97d..cf96a90 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -25,6 +25,7 @@ set(REXKERNEL_SOURCES
+     xam/xam_misc.cpp
+     xam/apps/xam_app.cpp
+     xam/apps/xgi_app.cpp
++    xam/apps/xgi_live.cpp
+     xam/apps/xlivebase_app.cpp
+     xam/apps/xmp_app.cpp
+ 
 diff --git a/src/kernel/crt/threading.cpp b/src/kernel/crt/threading.cpp
 index 22ba2fb..dd2e68d 100644
 --- a/src/kernel/crt/threading.cpp
@@ -269483,12 +269630,15 @@ index 22ba2fb..dd2e68d 100644
      ks->UnregisterFiber(fiber_addr);
    }
 diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
-index 2b222da..4ea396b 100644
+index 2b222da..9697b85 100644
 --- a/src/kernel/xam/apps/xgi_app.cpp
 +++ b/src/kernel/xam/apps/xgi_app.cpp
-@@ -11,6 +11,10 @@
+@@ -10,7 +10,13 @@
+  */
  
  #include <rex/kernel/xam/apps/xgi_app.h>
++
++#include "xgi_live.h"
  #include <rex/logging.h>
 +#include <rex/system/xsocket.h>
 +
@@ -269497,7 +269647,19 @@ index 2b222da..4ea396b 100644
  #include <rex/thread.h>
  
  namespace rex {
-@@ -108,11 +112,34 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -29,6 +35,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                       uint32_t buffer_length) {
+   // NOTE: buffer_length may be zero or valid.
+   auto buffer = memory_->TranslateVirtual(buffer_ptr);
++  // Sessions and user contexts/properties go to the Live server when signed
++  // in to it; everything else (system link, offline) stays below.
++  if (auto live = xgi_live::Dispatch(kernel_state_, message, buffer_ptr, buffer_length)) {
++    return *live;
++  }
+   switch (message) {
+     case 0x000B0006: {
+       assert_true(!buffer_length || buffer_length == 24);
+@@ -108,11 +119,34 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 20);
        uint32_t nonce_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
  
@@ -269533,7 +269695,7 @@ index 2b222da..4ea396b 100644
        return X_E_SUCCESS;
      }
      case 0x000B0011: {
-@@ -122,7 +149,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -122,7 +156,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
        uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
  
@@ -269542,7 +269704,7 @@ index 2b222da..4ea396b 100644
  
        return X_E_SUCCESS;
      }
-@@ -135,7 +162,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -135,7 +169,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t private_slots_array = memory::load_and_swap<uint32_t>(buffer + 16);
        bool is_local = xuid_array_ptr == 0;
  
@@ -269551,7 +269713,7 @@ index 2b222da..4ea396b 100644
                      is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
                      user_count, xuid_array_ptr, user_index_array, private_slots_array);
        return X_E_SUCCESS;
-@@ -147,7 +174,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -147,7 +181,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
        uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
  
@@ -269560,7 +269722,7 @@ index 2b222da..4ea396b 100644
  
        return X_STATUS_SUCCESS;
      }
-@@ -159,7 +186,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -159,7 +193,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
        uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
  
@@ -269569,7 +269731,7 @@ index 2b222da..4ea396b 100644
  
        return X_E_SUCCESS;
      }
-@@ -176,7 +203,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -176,7 +210,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 24);
        uint32_t search_results_ptr = memory::load_and_swap<uint32_t>(buffer + 28);
  
@@ -269578,7 +269740,7 @@ index 2b222da..4ea396b 100644
                      user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                      results_buffer_size, search_results_ptr);
        return X_E_SUCCESS;
-@@ -189,7 +216,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -189,7 +223,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t maxPublicSlots = memory::load_and_swap<uint32_t>(buffer + 8);
        uint16_t maxPrivateSlots = memory::load_and_swap<uint16_t>(buffer + 12);
  
@@ -269587,7 +269749,7 @@ index 2b222da..4ea396b 100644
                      maxPublicSlots, maxPrivateSlots);
  
        return X_E_SUCCESS;
-@@ -210,7 +237,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -210,7 +244,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        //
        uint32_t num_users = memory::load_and_swap<uint32_t>(buffer + 32);
  
@@ -269596,7 +269758,7 @@ index 2b222da..4ea396b 100644
                      proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
                      results_buffer_size, search_results_ptr, num_users);
  
-@@ -226,7 +253,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -226,7 +260,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 16);
        uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 20);
  
@@ -269605,7 +269767,7 @@ index 2b222da..4ea396b 100644
                      details_buffer_size, session_details_ptr, reserved1, reserved2, reserved3);
  
        return X_E_SUCCESS;
-@@ -241,7 +268,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -241,7 +275,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 16);
        uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 20);
  
@@ -269614,7 +269776,7 @@ index 2b222da..4ea396b 100644
                      session_info_ptr, user_index, reserved1, reserved2, reserved3);
  
        return X_E_SUCCESS;
-@@ -252,7 +279,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -252,7 +286,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
        uint32_t session_info_ptr = memory::load_and_swap<uint32_t>(buffer + 4);
  
@@ -269623,7 +269785,7 @@ index 2b222da..4ea396b 100644
                      session_info_ptr);
  
        return X_E_SUCCESS;
-@@ -267,7 +294,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -267,7 +301,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t results_buffer_size = memory::load_and_swap<uint32_t>(buffer + 20);
        uint32_t results_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
  
@@ -269632,7 +269794,7 @@ index 2b222da..4ea396b 100644
                      obj_ptr, flags, session_nonce, session_duration_sec, results_buffer_size,
                      results_ptr);
  
-@@ -285,7 +312,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -285,7 +319,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
        uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
  
@@ -269641,7 +269803,7 @@ index 2b222da..4ea396b 100644
                      user_index, num_session_ids, session_ids_ptr, results_buffer_size,
                      search_results_ptr, reserved1, reserved2, reserved3);
  
-@@ -301,7 +328,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -301,7 +335,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 16);
        uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 20);
  
@@ -269650,7 +269812,7 @@ index 2b222da..4ea396b 100644
                      xuid_array_ptr, reserved1, reserved2, reserved3);
  
        return X_E_SUCCESS;
-@@ -340,7 +367,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -340,7 +374,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
        uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
  
@@ -269659,7 +269821,7 @@ index 2b222da..4ea396b 100644
                      views_ptr);
  
        return X_E_SUCCESS;
-@@ -353,7 +380,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -353,7 +387,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t num_views = memory::load_and_swap<uint32_t>(buffer + 12);
        uint32_t views_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
  
@@ -269668,7 +269830,7 @@ index 2b222da..4ea396b 100644
                      views_ptr);
  
        return X_E_SUCCESS;
-@@ -406,7 +433,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -406,7 +440,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t reserved2 = memory::load_and_swap<uint32_t>(buffer + 24);
        uint32_t reserved3 = memory::load_and_swap<uint32_t>(buffer + 28);
  
@@ -269677,7 +269839,7 @@ index 2b222da..4ea396b 100644
                      user_index, num_session_ids, session_ids_ptr, results_buffer_size,
                      search_results_ptr, reserved1, reserved2, reserved3);
  
-@@ -431,7 +458,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -431,7 +465,7 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
        uint32_t num_users = memory::load_and_swap<uint32_t>(buffer + 44);
        uint32_t weighted_search = memory::load_and_swap<uint32_t>(buffer + 48);
  
@@ -269686,20 +269848,1916 @@ index 2b222da..4ea396b 100644
            "XSessionSearchWeighted({:08X}, {:08X}, {:08X}, {}, {}, {:08X}, {:08X}, {}, {}, {:08X}, "
            "{:08X}, {:08X}, {:08X}, {:08X}, {:08X})",
            proc_index, user_index, num_results, num_weighted_properties, num_weighted_contexts,
+diff --git a/src/kernel/xam/apps/xgi_live.cpp b/src/kernel/xam/apps/xgi_live.cpp
+new file mode 100644
+index 0000000..fecdba9
+--- /dev/null
++++ b/src/kernel/xam/apps/xgi_live.cpp
+@@ -0,0 +1,949 @@
++/**
++ * @file        xgi_live.cpp
++ * @brief       XGI sessions backed by the Xbox Live stand-in server.
++ *
++ * Guest layouts (big-endian), as the XDK defines them:
++ *   XSESSION_INFO (0x3C): XNKID sessionID; XNADDR hostAddress (0x24);
++ *                         XNKEY keyExchangeKey (0x10)
++ *   XSESSION_SEARCHRESULT (0x5C): info; open/filled public/private slots;
++ *                         cProperties; cContexts; pProperties; pContexts
++ *   XUSER_CONTEXT (8), XUSER_PROPERTY (0x18: id, pad, X_USER_DATA)
++ *   XSESSION_LOCAL_DETAILS (0x80), XSESSION_MEMBER (0x10)
++ *   XSESSION_REGISTRATION_RESULTS (8), XSESSION_REGISTRANT (0x18)
++ * Server contract: halo3-live-phoenix docs/design.md.
++ */
++
++#include "xgi_live.h"
++
++#include <atomic>
++#include <bit>
++#include <cstring>
++#include <map>
++#include <mutex>
++#include <random>
++#include <string>
++#include <vector>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/memory/utils.h>
++#include <rex/system/xam/user_profile.h>
++#include <rex/system/xlive.h>
++#include <rex/system/xsocket.h>
++
++#include <fmt/format.h>
++#include <inja/third_party/include/nlohmann/json.hpp>
++
++REXCVAR_DECLARE(bool, net_log);
++
++namespace rex::kernel::xam::xgi_live {
++
++using json = nlohmann::json;
++using rex::memory::load_and_swap;
++using rex::memory::store_and_swap;
++namespace xlive = rex::system::xlive;
++namespace xnet = rex::system::xnet;
++
++namespace {
++
++// XSESSION_CREATE_* flags.
++constexpr uint32_t kFlagHost = 0x1;
++constexpr uint32_t kFlagsLive = 0x2 | 0x4 | 0x8 | 0x10;  // presence, stats, matchmaking, arbitration
++
++constexpr uint32_t kContextGameType = 0x0000800A;
++constexpr uint32_t kContextGameMode = 0x0000800B;
++
++constexpr uint32_t kUserIndexNone = 0xFE;
++
++constexpr size_t kInfoSize = 0x3C;
++constexpr size_t kSearchResultSize = 0x5C;
++constexpr size_t kPropertySize = 0x18;
++constexpr size_t kContextSize = 0x8;
++
++// X_USER_DATA types.
++enum : uint8_t {
++  kTypeContext = 0,
++  kTypeInt32 = 1,
++  kTypeInt64 = 2,
++  kTypeDouble = 3,
++  kTypeWString = 4,
++  kTypeFloat = 5,
++  kTypeBinary = 6,
++  kTypeDateTime = 7,
++  kTypeNull = 0xFF,
++};
++
++struct Property {
++  uint32_t id = 0;
++  uint8_t type = kTypeNull;
++  uint64_t bits = 0;          // numeric value (int/float/double bits, filetime)
++  std::vector<uint8_t> blob;  // wstring (UTF-16BE, no terminator) / binary
++};
++
++struct UserData {
++  std::map<uint32_t, uint32_t> contexts;
++  std::map<uint32_t, Property> properties;
++};
++
++struct Session {
++  uint64_t id = 0;
++  uint32_t flags = 0;
++  uint32_t public_slots = 0;
++  uint32_t private_slots = 0;
++  uint32_t user_index = 0;
++  bool host = false;
++  uint64_t nonce = 0;
++  uint8_t info[kInfoSize] = {};  // XSESSION_INFO as the title sees it
++  int qos_reported = -1;          // last QoS state sent to the server
++};
++
++std::mutex mutex;
++std::map<uint32_t, uint32_t> handle_objects;  // session handle -> guest X_KSESSION
++std::map<uint32_t, Session> sessions;         // guest X_KSESSION -> Live session
++UserData users[4];
++std::atomic<uint32_t> next_handle{0xF5A00001};
++
++uint64_t Random64() {
++  static std::mt19937_64 rng{std::random_device{}()};
++  return rng();
++}
++
++system::xam::UserProfile* Profile(system::KernelState* ks) {
++  return ks->user_profile();
++}
++
++uint64_t OurXuid(system::KernelState* ks) {
++  return Profile(ks)->xuid();
++}
++
++std::string TitlePath(system::KernelState* ks) {
++  return "/xlive/v1/titles/" + xlive::Hex32(ks->title_id());
++}
++
++std::string SessionPath(system::KernelState* ks, uint64_t id) {
++  return TitlePath(ks) + "/sessions/" + xlive::Hex64(id);
++}
++
++std::string Ipv4(uint32_t ip) {
++  return fmt::format("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
++}
++
++// This instance's XNADDR (same shape XNetGetTitleXnAddr returns).
++void WriteOwnXnAddr(uint8_t* xna) {
++  std::memset(xna, 0, 0x24);
++  const uint32_t ip = xnet::LocalAddress();
++  store_and_swap<uint32_t>(xna + 0, ip);  // ina (network order)
++  const uint8_t enet[6] = {0x00, 0x1D, 0xD8, uint8_t(ip >> 16), uint8_t(ip >> 8), uint8_t(ip)};
++  std::memcpy(xna + 10, enet, 6);
++}
++
++uint64_t LoadXnkid(const uint8_t* p) {
++  return load_and_swap<uint64_t>(p);
++}
++
++// ---- properties -----------------------------------------------------------
++
++std::string Utf16BeToUtf8(const std::vector<uint8_t>& blob) {
++  std::string out;
++  for (size_t i = 0; i + 1 < blob.size(); i += 2) {
++    const uint32_t c = uint32_t(blob[i]) << 8 | blob[i + 1];
++    if (!c) break;
++    if (c < 0x80) {
++      out += char(c);
++    } else if (c < 0x800) {
++      out += char(0xC0 | (c >> 6));
++      out += char(0x80 | (c & 0x3F));
++    } else {
++      out += char(0xE0 | (c >> 12));
++      out += char(0x80 | ((c >> 6) & 0x3F));
++      out += char(0x80 | (c & 0x3F));
++    }
++  }
++  return out;
++}
++
++std::vector<uint8_t> Utf8ToUtf16Be(const std::string& s) {
++  std::vector<uint8_t> out;
++  for (size_t i = 0; i < s.size();) {
++    uint32_t c = uint8_t(s[i]);
++    if (c >= 0xE0 && i + 2 < s.size()) {
++      c = (c & 0x0F) << 12 | (uint8_t(s[i + 1]) & 0x3F) << 6 | (uint8_t(s[i + 2]) & 0x3F);
++      i += 3;
++    } else if (c >= 0xC0 && i + 1 < s.size()) {
++      c = (c & 0x1F) << 6 | (uint8_t(s[i + 1]) & 0x3F);
++      i += 2;
++    } else {
++      i += 1;
++    }
++    out.push_back(uint8_t(c >> 8));
++    out.push_back(uint8_t(c));
++  }
++  return out;
++}
++
++const char* TypeName(uint8_t type) {
++  switch (type) {
++    case kTypeInt32: return "int32";
++    case kTypeInt64: return "int64";
++    case kTypeDouble: return "double";
++    case kTypeWString: return "string";
++    case kTypeFloat: return "float";
++    case kTypeBinary: return "binary";
++    case kTypeDateTime: return "datetime";
++    default: return "null";
++  }
++}
++
++uint8_t TypeFromName(const std::string& name) {
++  if (name == "int32") return kTypeInt32;
++  if (name == "int64") return kTypeInt64;
++  if (name == "double") return kTypeDouble;
++  if (name == "string") return kTypeWString;
++  if (name == "float") return kTypeFloat;
++  if (name == "binary") return kTypeBinary;
++  if (name == "datetime") return kTypeDateTime;
++  return kTypeNull;
++}
++
++json PropertyJson(const Property& p) {
++  json j = {{"id", xlive::Hex32(p.id)}, {"type", TypeName(p.type)}};
++  switch (p.type) {
++    case kTypeInt32: j["value"] = int32_t(uint32_t(p.bits)); break;
++    case kTypeInt64: j["value"] = int64_t(p.bits); break;
++    case kTypeDateTime: j["value"] = p.bits; break;
++    case kTypeDouble: j["value"] = std::bit_cast<double>(p.bits); break;
++    case kTypeFloat: j["value"] = double(std::bit_cast<float>(uint32_t(p.bits))); break;
++    case kTypeWString: j["value"] = Utf16BeToUtf8(p.blob); break;
++    case kTypeBinary: j["value"] = xlive::Base64Encode(p.blob.data(), p.blob.size()); break;
++    default: j["value"] = nullptr; break;
++  }
++  return j;
++}
++
++Property PropertyFromJson(const json& j) {
++  Property p;
++  p.id = uint32_t(xlive::ParseHex64(j.value("id", "0")).value_or(0));
++  p.type = TypeFromName(j.value("type", "null"));
++  const json& v = j.contains("value") ? j["value"] : json();
++  switch (p.type) {
++    case kTypeInt32: p.bits = uint32_t(v.is_number() ? v.get<int64_t>() : 0); break;
++    case kTypeInt64:
++    case kTypeDateTime: p.bits = uint64_t(v.is_number() ? v.get<int64_t>() : 0); break;
++    case kTypeDouble: p.bits = std::bit_cast<uint64_t>(v.is_number() ? v.get<double>() : 0.0); break;
++    case kTypeFloat:
++      p.bits = std::bit_cast<uint32_t>(float(v.is_number() ? v.get<double>() : 0.0));
++      break;
++    case kTypeWString: p.blob = Utf8ToUtf16Be(v.is_string() ? v.get<std::string>() : ""); break;
++    case kTypeBinary: p.blob = xlive::Base64Decode(v.is_string() ? v.get<std::string>() : ""); break;
++    default: break;
++  }
++  return p;
++}
++
++// Reads a guest XUSER_PROPERTY.
++Property ReadGuestProperty(system::KernelState* ks, const uint8_t* g) {
++  Property p;
++  p.id = load_and_swap<uint32_t>(g + 0);
++  p.type = g[8];
++  const uint8_t* u = g + 16;
++  switch (p.type) {
++    case kTypeInt32:
++    case kTypeFloat: p.bits = load_and_swap<uint32_t>(u); break;
++    case kTypeInt64:
++    case kTypeDouble:
++    case kTypeDateTime: p.bits = load_and_swap<uint64_t>(u); break;
++    case kTypeWString:
++    case kTypeBinary: {
++      const uint32_t size = load_and_swap<uint32_t>(u + 0);
++      const uint32_t ptr = load_and_swap<uint32_t>(u + 4);
++      if (ptr && size && size < 0x10000) {
++        const uint8_t* data = ks->memory()->TranslateVirtual<uint8_t*>(ptr);
++        p.blob.assign(data, data + size);
++        if (p.type == kTypeWString) {  // drop the terminator
++          while (p.blob.size() >= 2 && !p.blob[p.blob.size() - 1] && !p.blob[p.blob.size() - 2]) {
++            p.blob.resize(p.blob.size() - 2);
++          }
++        }
++      }
++      break;
++    }
++    default: break;
++  }
++  return p;
++}
++
++// XGIUserSetPropertyEx value: raw big-endian bytes of the property's type.
++Property PropertyFromRaw(uint32_t id, const uint8_t* value, uint32_t size) {
++  Property p;
++  p.id = id;
++  p.type = uint8_t((id >> 28) & 0xF);
++  switch (p.type) {
++    case kTypeInt32:
++    case kTypeFloat: p.bits = size >= 4 ? load_and_swap<uint32_t>(value) : 0; break;
++    case kTypeInt64:
++    case kTypeDouble:
++    case kTypeDateTime: p.bits = size >= 8 ? load_and_swap<uint64_t>(value) : 0; break;
++    case kTypeWString:
++    case kTypeBinary:
++      if (value && size < 0x10000) {
++        p.blob.assign(value, value + size);
++      }
++      if (p.type == kTypeWString) {
++        while (p.blob.size() >= 2 && !p.blob[p.blob.size() - 1] && !p.blob[p.blob.size() - 2]) {
++          p.blob.resize(p.blob.size() - 2);
++        }
++      }
++      break;
++    default: break;
++  }
++  return p;
++}
++
++// Bytes a property needs past its XUSER_PROPERTY (string/binary payloads).
++size_t PropertyExtra(const Property& p) {
++  if (p.type == kTypeWString) return (p.blob.size() + 2 + 3) & ~size_t(3);
++  if (p.type == kTypeBinary) return (p.blob.size() + 3) & ~size_t(3);
++  return 0;
++}
++
++// Writes a guest XUSER_PROPERTY; payload goes to *extra (guest address advanced).
++void WriteGuestProperty(uint8_t* g, const Property& p, uint8_t* extra_host, uint32_t extra_guest) {
++  std::memset(g, 0, kPropertySize);
++  store_and_swap<uint32_t>(g + 0, p.id);
++  g[8] = p.type;
++  uint8_t* u = g + 16;
++  switch (p.type) {
++    case kTypeInt32:
++    case kTypeFloat: store_and_swap<uint32_t>(u, uint32_t(p.bits)); break;
++    case kTypeInt64:
++    case kTypeDouble:
++    case kTypeDateTime: store_and_swap<uint64_t>(u, p.bits); break;
++    case kTypeWString:
++      std::memcpy(extra_host, p.blob.data(), p.blob.size());
++      extra_host[p.blob.size()] = 0;
++      extra_host[p.blob.size() + 1] = 0;
++      store_and_swap<uint32_t>(u + 0, uint32_t(p.blob.size() + 2));
++      store_and_swap<uint32_t>(u + 4, extra_guest);
++      break;
++    case kTypeBinary:
++      std::memcpy(extra_host, p.blob.data(), p.blob.size());
++      store_and_swap<uint32_t>(u + 0, uint32_t(p.blob.size()));
++      store_and_swap<uint32_t>(u + 4, extra_guest);
++      break;
++    default: break;
++  }
++}
++
++json ContextsJson(const std::map<uint32_t, uint32_t>& contexts) {
++  json a = json::array();
++  for (const auto& [id, value] : contexts) {
++    a.push_back({{"id", xlive::Hex32(id)}, {"value", value}});
++  }
++  return a;
++}
++
++json PropertiesJson(const std::map<uint32_t, Property>& properties) {
++  json a = json::array();
++  for (const auto& [id, p] : properties) {
++    a.push_back(PropertyJson(p));
++  }
++  return a;
++}
++
++// ---- server calls ---------------------------------------------------------
++
++std::optional<json> Call(const std::string& method, const std::string& path, const json& body) {
++  const auto r = xlive::Request(method, path, body.is_null() ? std::string() : body.dump());
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: {} {} -> {}", method, path, r.status);
++  }
++  if (!r.ok()) {
++    if (r.status != 404) {
++      REXKRNL_WARN("xlive: {} {} failed (HTTP {}): {}", method, path, r.status,
++                   r.body.substr(0, 200));
++    }
++    return std::nullopt;
++  }
++  if (r.body.empty()) {
++    return json::object();
++  }
++  auto parsed = json::parse(r.body, nullptr, false);
++  if (parsed.is_discarded()) {
++    return std::nullopt;
++  }
++  return parsed;
++}
++
++json HostFields(system::KernelState* ks, const Session& s) {
++  return {
++      {"hostXuid", xlive::Hex64(OurXuid(ks))},
++      {"hostAddress", Ipv4(xnet::LocalAddress())},
++      {"macAddress", xlive::MacAddressHex()},
++      {"port", xnet::ToHostPort(1000)},
++      {"xnaddr", xlive::Base64Encode(s.info + 8, 0x24)},
++      {"xnkey", xlive::Base64Encode(s.info + 0x2C, 0x10)},
++  };
++}
++
++void PushUserData(system::KernelState* ks, uint32_t user_index) {
++  // A host's contexts/properties are its session's attributes on Live.
++  std::vector<uint64_t> ids;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    for (const auto& [obj, s] : sessions) {
++      if (s.host && s.user_index == user_index) ids.push_back(s.id);
++    }
++  }
++  if (ids.empty() || user_index >= 4) return;
++  json body;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    body = {{"properties", PropertiesJson(users[user_index].properties)},
++            {"contexts", ContextsJson(users[user_index].contexts)}};
++  }
++  for (uint64_t id : ids) {
++    Call("POST", SessionPath(ks, id) + "/properties", body);
++  }
++}
++
++// ---- guest result writers -------------------------------------------------
++
++// Fills XSESSION_SEARCHRESULT_HEADER + results (+ their properties/contexts)
++// into the title's buffer; results that do not fit are dropped.
++void WriteSearchResults(system::KernelState* ks, const json& list, uint32_t results_ptr,
++                        uint32_t buffer_size) {
++  auto* mem = ks->memory();
++  uint8_t* base = mem->TranslateVirtual<uint8_t*>(results_ptr);
++  if (!base || buffer_size < 8) return;
++  std::memset(base, 0, buffer_size);
++
++  struct Parsed {
++    const json* session;
++    std::vector<Property> properties;
++    std::vector<std::pair<uint32_t, uint32_t>> contexts;
++    size_t tail = 0;
++  };
++  std::vector<Parsed> parsed;
++  for (const auto& s : list) {
++    Parsed p{&s, {}, {}, 0};
++    for (const auto& c : s.value("contexts", json::array())) {
++      p.contexts.emplace_back(uint32_t(xlive::ParseHex64(c.value("id", "0")).value_or(0)),
++                              c.value("value", 0u));
++    }
++    for (const auto& j : s.value("properties", json::array())) {
++      p.properties.push_back(PropertyFromJson(j));
++    }
++    p.tail = p.contexts.size() * kContextSize + p.properties.size() * kPropertySize;
++    for (const auto& prop : p.properties) p.tail += PropertyExtra(prop);
++    parsed.push_back(std::move(p));
++  }
++  // Keep as many results as fit.
++  size_t count = parsed.size();
++  for (;; --count) {
++    size_t need = 8 + count * kSearchResultSize;
++    for (size_t i = 0; i < count; ++i) need += parsed[i].tail;
++    if (need <= buffer_size || count == 0) break;
++  }
++
++  uint32_t tail_guest = results_ptr + 8 + uint32_t(count * kSearchResultSize);
++  for (size_t i = 0; i < count; ++i) {
++    const json& s = *parsed[i].session;
++    uint8_t* r = base + 8 + i * kSearchResultSize;
++    store_and_swap<uint64_t>(r + 0, xlive::ParseHex64(s.value("sessionId", "0")).value_or(0));
++    const auto xnaddr = xlive::Base64Decode(s.value("xnaddr", ""));
++    std::memcpy(r + 8, xnaddr.data(), std::min<size_t>(xnaddr.size(), 0x24));
++    const auto xnkey = xlive::Base64Decode(s.value("xnkey", ""));
++    std::memcpy(r + 0x2C, xnkey.data(), std::min<size_t>(xnkey.size(), 0x10));
++    store_and_swap<uint32_t>(r + 60, s.value("openPublicSlots", 0u));
++    store_and_swap<uint32_t>(r + 64, s.value("openPrivateSlots", 0u));
++    store_and_swap<uint32_t>(r + 68, s.value("filledPublicSlots", 0u));
++    store_and_swap<uint32_t>(r + 72, s.value("filledPrivateSlots", 0u));
++    store_and_swap<uint32_t>(r + 76, uint32_t(parsed[i].properties.size()));
++    store_and_swap<uint32_t>(r + 80, uint32_t(parsed[i].contexts.size()));
++    // Contexts, then properties, then property payloads.
++    const uint32_t ctx_guest = tail_guest;
++    uint8_t* ctx = mem->TranslateVirtual<uint8_t*>(ctx_guest);
++    for (size_t c = 0; c < parsed[i].contexts.size(); ++c) {
++      store_and_swap<uint32_t>(ctx + c * 8 + 0, parsed[i].contexts[c].first);
++      store_and_swap<uint32_t>(ctx + c * 8 + 4, parsed[i].contexts[c].second);
++    }
++    const uint32_t props_guest = ctx_guest + uint32_t(parsed[i].contexts.size() * kContextSize);
++    uint32_t extra_guest = props_guest + uint32_t(parsed[i].properties.size() * kPropertySize);
++    for (size_t k = 0; k < parsed[i].properties.size(); ++k) {
++      const Property& prop = parsed[i].properties[k];
++      WriteGuestProperty(mem->TranslateVirtual<uint8_t*>(props_guest + uint32_t(k * kPropertySize)),
++                         prop, mem->TranslateVirtual<uint8_t*>(extra_guest), extra_guest);
++      extra_guest += uint32_t(PropertyExtra(prop));
++    }
++    store_and_swap<uint32_t>(r + 84, parsed[i].properties.empty() ? 0 : props_guest);
++    store_and_swap<uint32_t>(r + 88, parsed[i].contexts.empty() ? 0 : ctx_guest);
++    tail_guest += uint32_t(parsed[i].tail);
++  }
++  store_and_swap<uint32_t>(base + 0, uint32_t(count));
++  store_and_swap<uint32_t>(base + 4, count ? results_ptr + 8 : 0);
++}
++
++json SearchBody(system::KernelState* ks, uint32_t proc_index, uint32_t num_results,
++                uint32_t num_users, uint32_t num_props, uint32_t props_ptr, uint32_t num_ctx,
++                uint32_t ctx_ptr) {
++  auto* mem = ks->memory();
++  json properties = json::array(), contexts = json::array();
++  for (uint32_t i = 0; props_ptr && i < num_props; ++i) {
++    properties.push_back(PropertyJson(
++        ReadGuestProperty(ks, mem->TranslateVirtual<uint8_t*>(props_ptr + i * kPropertySize))));
++  }
++  for (uint32_t i = 0; ctx_ptr && i < num_ctx; ++i) {
++    const uint8_t* c = mem->TranslateVirtual<uint8_t*>(ctx_ptr + i * kContextSize);
++    contexts.push_back({{"id", xlive::Hex32(load_and_swap<uint32_t>(c))},
++                        {"value", load_and_swap<uint32_t>(c + 4)}});
++  }
++  return {{"procedureIndex", proc_index}, {"maxResults", num_results},
++          {"numUsers", std::max<uint32_t>(num_users, 1)}, {"properties", properties},
++          {"contexts", contexts}, {"excludeXuid", xlive::Hex64(OurXuid(ks))}};
++}
++
++X_HRESULT Search(system::KernelState* ks, const json& body, uint32_t results_ptr,
++                 uint32_t buffer_size) {
++  auto r = Call("POST", TitlePath(ks) + "/sessions/search", body);
++  const json list = r ? r->value("sessions", json::array()) : json::array();
++  WriteSearchResults(ks, list, results_ptr, buffer_size);
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: XSessionSearch proc {} -> {} sessions", body.value("procedureIndex", 0u),
++                 list.size());
++  }
++  return X_E_SUCCESS;
++}
++
++Session* Find(uint32_t obj) {
++  auto it = sessions.find(obj);
++  return it == sessions.end() ? nullptr : &it->second;
++}
++
++std::vector<json> Members(system::KernelState* ks, uint32_t count, uint32_t xuids_ptr,
++                          uint32_t indices_ptr, uint32_t private_ptr) {
++  auto* mem = ks->memory();
++  std::vector<json> out;
++  for (uint32_t i = 0; i < count && i < 16; ++i) {
++    uint64_t xuid = 0;
++    if (xuids_ptr) {
++      xuid = load_and_swap<uint64_t>(mem->TranslateVirtual<uint8_t*>(xuids_ptr + i * 8));
++    } else if (indices_ptr) {
++      const uint32_t index = load_and_swap<uint32_t>(mem->TranslateVirtual<uint8_t*>(indices_ptr + i * 4));
++      if (index != 0) continue;  // one local profile
++      xuid = OurXuid(ks);
++    }
++    const bool is_private =
++        private_ptr && load_and_swap<uint32_t>(mem->TranslateVirtual<uint8_t*>(private_ptr + i * 4));
++    if (xuid) {
++      out.push_back({{"xuid", xlive::Hex64(xuid)}, {"private", is_private}});
++    }
++  }
++  return out;
++}
++
++}  // namespace
++
++void OnQosListen(system::KernelState* ks, uint64_t xnkid, bool enabled) {
++  if (!xlive::Enabled()) {
++    return;
++  }
++  uint64_t id = 0;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    for (auto& [obj, s] : sessions) {
++      if (s.host && s.id == xnkid && s.qos_reported != int(enabled)) {
++        s.qos_reported = int(enabled);
++        id = s.id;
++        break;
++      }
++    }
++  }
++  if (id) {
++    Call("POST", SessionPath(ks, id) + "/modify", {{"qosEnabled", enabled}});
++  }
++}
++
++uint32_t CreateSessionHandle() {
++  return next_handle.fetch_add(1);
++}
++
++uint32_t SessionObjectForHandle(system::KernelState* ks, uint32_t handle) {
++  std::lock_guard<std::mutex> lock(mutex);
++  auto it = handle_objects.find(handle);
++  if (it != handle_objects.end()) {
++    return it->second;
++  }
++  const uint32_t obj = ks->memory()->SystemHeapAlloc(16);
++  std::memset(ks->memory()->TranslateVirtual<uint8_t*>(obj), 0, 16);
++  store_and_swap<uint32_t>(ks->memory()->TranslateVirtual<uint8_t*>(obj), handle);
++  handle_objects[handle] = obj;
++  return obj;
++}
++
++std::optional<X_HRESULT> Dispatch(system::KernelState* ks, uint32_t message, uint32_t buffer_ptr,
++                                  uint32_t buffer_length) {
++  if (!xlive::Enabled() || !buffer_ptr) {
++    return std::nullopt;
++  }
++  auto* mem = ks->memory();
++  uint8_t* b = mem->TranslateVirtual<uint8_t*>(buffer_ptr);
++  auto u32 = [b](size_t off) { return load_and_swap<uint32_t>(b + off); };
++
++  switch (message) {
++    case 0x000B0006: {  // XUserSetContext
++      const uint32_t user = u32(0);
++      if (user < 4) {
++        std::lock_guard<std::mutex> lock(mutex);
++        users[user].contexts[u32(16)] = u32(20);
++      }
++      PushUserData(ks, user);
++      return X_E_SUCCESS;
++    }
++    case 0x000B0007: {  // XUserSetProperty
++      const uint32_t user = u32(0);
++      const uint32_t id = u32(16), size = u32(20), ptr = u32(24);
++      if (user < 4) {
++        const uint8_t* value = ptr ? mem->TranslateVirtual<uint8_t*>(ptr) : nullptr;
++        std::lock_guard<std::mutex> lock(mutex);
++        users[user].properties[id] = PropertyFromRaw(id, value, size);
++      }
++      PushUserData(ks, user);
++      return X_E_SUCCESS;
++    }
++    case 0x000B0041: {  // XUserGetContext
++      const uint32_t user = u32(0), ctx_ptr = u32(16);
++      if (user >= 4 || !ctx_ptr) return std::nullopt;
++      uint8_t* ctx = mem->TranslateVirtual<uint8_t*>(ctx_ptr);
++      std::lock_guard<std::mutex> lock(mutex);
++      auto it = users[user].contexts.find(load_and_swap<uint32_t>(ctx));
++      if (it == users[user].contexts.end()) return std::nullopt;
++      store_and_swap<uint32_t>(ctx + 4, it->second);
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B0010: {  // XSessionCreate
++      const uint32_t obj = u32(0), flags = u32(4);
++      if (!(flags & kFlagsLive)) {
++        return std::nullopt;  // system link / local session
++      }
++      Session s;
++      s.flags = flags;
++      s.public_slots = u32(8);
++      s.private_slots = u32(12);
++      s.user_index = u32(16);
++      s.host = (flags & kFlagHost) != 0;
++      const uint32_t info_ptr = u32(20), nonce_ptr = u32(24);
++      uint8_t* info = info_ptr ? mem->TranslateVirtual<uint8_t*>(info_ptr) : nullptr;
++      if (s.host) {
++        if (info) {
++          if (!LoadXnkid(info)) {
++            // XNKID_ONLINE_PEER: top nibble 8.
++            store_and_swap<uint64_t>(info, (Random64() & 0x0FFFFFFFFFFFFFFFull) | 0x8000000000000000ull);
++          }
++          WriteOwnXnAddr(info + 8);
++          uint64_t zero[2] = {};
++          if (!std::memcmp(info + 0x2C, zero, 16)) {
++            store_and_swap<uint64_t>(info + 0x2C, Random64());
++            store_and_swap<uint64_t>(info + 0x34, Random64());
++          }
++        }
++        s.nonce = Random64();
++        if (nonce_ptr) store_and_swap<uint64_t>(mem->TranslateVirtual<uint8_t*>(nonce_ptr), s.nonce);
++      }
++      if (info) {
++        std::memcpy(s.info, info, kInfoSize);
++        s.id = LoadXnkid(info);
++      }
++      if (s.host) {
++        json body = HostFields(ks, s);
++        body["sessionId"] = xlive::Hex64(s.id);
++        body["flags"] = s.flags;
++        body["publicSlots"] = s.public_slots;
++        body["privateSlots"] = s.private_slots;
++        {
++          std::lock_guard<std::mutex> lock(mutex);
++          const UserData& u = users[s.user_index < 4 ? s.user_index : 0];
++          body["properties"] = PropertiesJson(u.properties);
++          body["contexts"] = ContextsJson(u.contexts);
++        }
++        if (!Call("POST", TitlePath(ks) + "/sessions", body)) {
++          return X_E_FAIL;
++        }
++      }
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        sessions[obj] = s;
++      }
++      REXKRNL_INFO("xlive: XSessionCreate {} {:016X} flags {:#x} slots {}/{}",
++                   s.host ? "host" : "join", s.id, s.flags, s.public_slots, s.private_slots);
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B0011: {  // XSessionDelete
++      Session s;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* found = Find(u32(0));
++        if (!found) return std::nullopt;
++        s = *found;
++        sessions.erase(u32(0));
++      }
++      if (s.host) {
++        Call("DELETE", SessionPath(ks, s.id), json());
++      } else {
++        Call("POST", SessionPath(ks, s.id) + "/leave",
++             {{"xuids", json::array({xlive::Hex64(OurXuid(ks))})}});
++      }
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B0012:    // XSessionJoinLocal / JoinRemote
++    case 0x000B0013: {  // XSessionLeaveLocal / LeaveRemote
++      uint64_t id;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* s = Find(u32(0));
++        if (!s) return std::nullopt;
++        id = s->id;
++      }
++      const auto members = Members(ks, u32(4), u32(8), u32(12), message == 0x000B0012 ? u32(16) : 0);
++      if (members.empty()) return X_E_SUCCESS;
++      if (message == 0x000B0012) {
++        Call("POST", SessionPath(ks, id) + "/join", {{"players", members}});
++      } else {
++        json xuids = json::array();
++        for (const auto& m : members) xuids.push_back(m["xuid"]);
++        Call("POST", SessionPath(ks, id) + "/leave", {{"xuids", xuids}});
++      }
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B0014:    // XSessionStart
++    case 0x000B0015: {  // XSessionEnd
++      uint64_t id;
++      bool host;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* s = Find(u32(0));
++        if (!s) return std::nullopt;
++        id = s->id;
++        host = s->host;
++      }
++      if (host) {
++        Call("POST", SessionPath(ks, id) + (message == 0x000B0014 ? "/start" : "/end"),
++             json::object());
++      }
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B0018: {  // XSessionModify
++      uint64_t id;
++      bool host;
++      uint32_t flags;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* s = Find(u32(0));
++        if (!s) return std::nullopt;
++        // XSessionModify changes only the join/invite options
++        // (INVITES_DISABLED, JOIN_VIA_PRESENCE_DISABLED,
++        // JOIN_IN_PROGRESS_DISABLED, JOIN_VIA_PRESENCE_FRIENDS_ONLY); the
++        // session type flags stay.
++        constexpr uint32_t kModifiable = 0x100 | 0x200 | 0x400 | 0x800;
++        s->flags = (s->flags & ~kModifiable) | (u32(4) & kModifiable);
++        s->public_slots = u32(8);
++        s->private_slots = u32(12);
++        id = s->id;
++        host = s->host;
++        flags = s->flags;
++      }
++      if (host) {
++        Call("POST", SessionPath(ks, id) + "/modify",
++             {{"flags", flags}, {"publicSlots", u32(8)}, {"privateSlots", u32(12)}});
++      }
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B0016:    // XSessionSearch
++    case 0x000B001C: {  // XSessionSearchEx
++      const uint32_t num_users = message == 0x000B001C ? u32(32) : 1;
++      const json body = SearchBody(ks, u32(0), u32(8), num_users, load_and_swap<uint16_t>(b + 12),
++                                   u32(16), load_and_swap<uint16_t>(b + 14), u32(20));
++      return Search(ks, body, u32(28), u32(24));
++    }
++    case 0x000B0065: {  // XSessionSearchWeighted: weights ignored, non-weighted filters kept
++      const json body = SearchBody(ks, u32(0), u32(8), u32(44), load_and_swap<uint16_t>(b + 24),
++                                   u32(28), load_and_swap<uint16_t>(b + 26), u32(32));
++      return Search(ks, body, u32(40), u32(36));
++    }
++
++    case 0x000B001B:    // XSessionSearchByID / ByIDs
++    case 0x000B0060: {
++      std::vector<uint64_t> ids;
++      uint32_t results_ptr, buffer_size;
++      if (buffer_length == 20) {  // user, XNKID, size, results
++        ids.push_back(LoadXnkid(b + 4));
++        buffer_size = u32(12);
++        results_ptr = u32(16);
++      } else {  // user, count, ids ptr, size, results
++        for (uint32_t i = 0; i < u32(4) && i < 100; ++i) {
++          ids.push_back(LoadXnkid(mem->TranslateVirtual<uint8_t*>(u32(8) + i * 8)));
++        }
++        buffer_size = u32(12);
++        results_ptr = u32(16);
++      }
++      json list = json::array();
++      for (uint64_t id : ids) {
++        if (auto s = Call("GET", SessionPath(ks, id), json())) list.push_back(*s);
++      }
++      WriteSearchResults(ks, list, results_ptr, buffer_size);
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B001D: {  // XSessionGetDetails
++      Session s;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* found = Find(u32(0));
++        if (!found) return std::nullopt;
++        s = *found;
++      }
++      const uint32_t size = u32(4), details_ptr = u32(8);
++      auto remote = Call("GET", SessionPath(ks, s.id), json());
++      if (!remote || !details_ptr || size < 0x80) return X_E_FAIL;
++      uint8_t* d = mem->TranslateVirtual<uint8_t*>(details_ptr);
++      std::memset(d, 0, 0x80);
++      uint32_t game_type = 0, game_mode = 0;
++      for (const auto& c : remote->value("contexts", json::array())) {
++        const uint32_t cid = uint32_t(xlive::ParseHex64(c.value("id", "0")).value_or(0));
++        if (cid == kContextGameType) game_type = c.value("value", 0u);
++        if (cid == kContextGameMode) game_mode = c.value("value", 0u);
++      }
++      const std::string state = remote->value("state", "lobby");
++      const auto players = remote->value("players", json::array());
++      const uint32_t fit = std::min<uint32_t>(uint32_t(players.size()), (size - 0x80) / 0x10);
++      store_and_swap<uint32_t>(d + 0, s.host ? s.user_index : kUserIndexNone);
++      store_and_swap<uint32_t>(d + 4, game_type);
++      store_and_swap<uint32_t>(d + 8, game_mode);
++      store_and_swap<uint32_t>(d + 12, remote->value("flags", s.flags));
++      store_and_swap<uint32_t>(d + 16, remote->value("publicSlots", s.public_slots));
++      store_and_swap<uint32_t>(d + 20, remote->value("privateSlots", s.private_slots));
++      store_and_swap<uint32_t>(d + 24, remote->value("openPublicSlots", 0u));
++      store_and_swap<uint32_t>(d + 28, remote->value("openPrivateSlots", 0u));
++      store_and_swap<uint32_t>(d + 32, uint32_t(players.size()));
++      store_and_swap<uint32_t>(d + 36, fit);
++      store_and_swap<uint32_t>(d + 40, state == "in_game" ? 2u : state == "ended" ? 3u : 0u);
++      store_and_swap<uint64_t>(d + 48, s.nonce);
++      std::memcpy(d + 56, s.info, kInfoSize);
++      store_and_swap<uint64_t>(d + 116, s.id);
++      const uint32_t members_ptr = details_ptr + 0x80;
++      for (uint32_t i = 0; i < fit; ++i) {
++        uint8_t* m = mem->TranslateVirtual<uint8_t*>(members_ptr + i * 0x10);
++        const uint64_t xuid = xlive::ParseHex64(players[i].value("xuid", "0")).value_or(0);
++        store_and_swap<uint64_t>(m + 0, xuid);
++        store_and_swap<uint32_t>(m + 8, xuid == OurXuid(ks) ? 0u : kUserIndexNone);
++        store_and_swap<uint32_t>(m + 12, players[i].value("private", false) ? 1u : 0u);
++      }
++      store_and_swap<uint32_t>(d + 124, fit ? members_ptr : 0);
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B001E: {  // XSessionMigrateHost: this instance becomes the host
++      Session s;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* found = Find(u32(0));
++        if (!found) return std::nullopt;
++        WriteOwnXnAddr(found->info + 8);
++        found->host = true;
++        found->user_index = u32(8);
++        s = *found;
++      }
++      if (u32(4)) {
++        std::memcpy(mem->TranslateVirtual<uint8_t*>(u32(4)), s.info, kInfoSize);
++      }
++      Call("POST", SessionPath(ks, s.id) + "/migrate", HostFields(ks, s));
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B001A: {  // XSessionArbitrationRegister
++      Session s;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* found = Find(u32(0));
++        if (!found) return std::nullopt;
++        s = *found;
++      }
++      const uint64_t nonce = load_and_swap<uint64_t>(b + 8);
++      const uint32_t size = u32(20), results_ptr = u32(24);
++      auto r = Call("POST", SessionPath(ks, s.id) + "/arbitration",
++                    {{"nonce", xlive::Hex64(nonce)}});
++      if (!r || !results_ptr || size < 8) return X_E_FAIL;
++      // XSESSION_REGISTRATION_RESULTS, then registrants, then their XUIDs.
++      const auto machines = r->value("machines", json::array());
++      uint8_t* res = mem->TranslateVirtual<uint8_t*>(results_ptr);
++      std::memset(res, 0, size);
++      uint32_t count = 0;
++      uint32_t xuid_guest = results_ptr + 8 + uint32_t(machines.size()) * 0x18;
++      for (const auto& m : machines) {
++        const auto players = m.value("players", json::array());
++        if (xuid_guest + players.size() * 8 > results_ptr + size) break;
++        uint8_t* reg = res + 8 + count * 0x18;
++        store_and_swap<uint64_t>(reg + 0, xlive::ParseHex64(m.value("machineId", "0")).value_or(0));
++        store_and_swap<uint32_t>(reg + 8, 1);  // trustworthiness
++        store_and_swap<uint32_t>(reg + 12, uint32_t(players.size()));
++        store_and_swap<uint32_t>(reg + 16, xuid_guest);
++        for (const auto& x : players) {
++          store_and_swap<uint64_t>(mem->TranslateVirtual<uint8_t*>(xuid_guest),
++                                   xlive::ParseHex64(x.get<std::string>()).value_or(0));
++          xuid_guest += 8;
++        }
++        ++count;
++      }
++      store_and_swap<uint32_t>(res + 0, count);
++      store_and_swap<uint32_t>(res + 4, count ? results_ptr + 8 : 0);
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B0025:    // XSessionWriteStats
++    case 0x000B0026: {  // XSessionFlushStats
++      uint64_t id;
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        Session* s = Find(u32(0));
++        if (!s) return std::nullopt;
++        id = s->id;
++      }
++      Call("POST", SessionPath(ks, id) + "/stats",
++           {{"xuid", xlive::Hex64(load_and_swap<uint64_t>(b + 4))},
++            {"flush", message == 0x000B0026},
++            {"views", u32(12)}});
++      return X_E_SUCCESS;
++    }
++
++    case 0x000B001F:  // XSessionModifySkill
++      return X_E_SUCCESS;
++
++    case 0x000B0021: {  // XUserReadStats: no stats kept yet; every view is empty
++      // XUSER_STATS_READ_RESULTS { dwNumViews; pViews } followed by
++      // XUSER_STATS_VIEW { dwViewId; dwTotalViewRows; dwNumRows; pRows }.
++      const uint32_t specs_count = u32(12), specs_ptr = u32(16);
++      const uint32_t size = u32(20), results_ptr = u32(24);
++      if (!results_ptr || size < 8) return X_E_SUCCESS;
++      const uint32_t views = std::min<uint32_t>(specs_count, (size - 8) / 16);
++      uint8_t* res = mem->TranslateVirtual<uint8_t*>(results_ptr);
++      std::memset(res, 0, 8 + views * 16);
++      store_and_swap<uint32_t>(res + 0, views);
++      store_and_swap<uint32_t>(res + 4, views ? results_ptr + 8 : 0);
++      for (uint32_t i = 0; i < views; ++i) {
++        // XUSER_STATS_SPEC: dwViewId, dwNumColumnIds, rgwColumnIds[64] (0x88 bytes)
++        const uint32_t view_id =
++            specs_ptr ? load_and_swap<uint32_t>(mem->TranslateVirtual<uint8_t*>(specs_ptr + i * 0x88)) : 0;
++        store_and_swap<uint32_t>(res + 8 + i * 16, view_id);
++      }
++      return X_E_SUCCESS;
++    }
++  }
++  return std::nullopt;
++}
++
++}  // namespace rex::kernel::xam::xgi_live
+diff --git a/src/kernel/xam/apps/xgi_live.h b/src/kernel/xam/apps/xgi_live.h
+new file mode 100644
+index 0000000..4e3fd99
+--- /dev/null
++++ b/src/kernel/xam/apps/xgi_live.h
+@@ -0,0 +1,33 @@
++/**
++ * @file        xgi_live.h
++ * @brief       XGI sessions (XSession*) backed by the Xbox Live stand-in
++ *              server (rex::system::xlive). Used by XgiApp when live_server
++ *              is set; system link and offline sessions keep the local path.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <optional>
++
++#include <rex/system/kernel_state.h>
++#include <rex/system/xtypes.h>
++
++namespace rex::kernel::xam::xgi_live {
++
++// XamSessionCreateHandle / XamSessionRefObjByHandle: unique handles, each with
++// a guest X_KSESSION { be<u32> handle } the XGI messages refer to.
++uint32_t CreateSessionHandle();
++uint32_t SessionObjectForHandle(system::KernelState* kernel_state, uint32_t handle);
++
++// XNetQosListen changed the enabled state for `xnkid` (big-endian value):
++// tells the server when it is a Live session this instance hosts, so search
++// only returns sessions whose host answers QoS probes.
++void OnQosListen(system::KernelState* kernel_state, uint64_t xnkid, bool enabled);
++
++// Handles one XGI message when it concerns the Live server; nullopt means
++// "not a Live request, use the local implementation".
++std::optional<X_HRESULT> Dispatch(system::KernelState* kernel_state, uint32_t message,
++                                  uint32_t buffer_ptr, uint32_t buffer_length);
++
++}  // namespace rex::kernel::xam::xgi_live
+diff --git a/src/kernel/xam/apps/xlivebase_app.cpp b/src/kernel/xam/apps/xlivebase_app.cpp
+index 3593403..a4b5224 100644
+--- a/src/kernel/xam/apps/xlivebase_app.cpp
++++ b/src/kernel/xam/apps/xlivebase_app.cpp
+@@ -10,25 +10,435 @@
+  */
+ 
+ #include <rex/kernel/xam/apps/xlivebase_app.h>
++
++#include <algorithm>
++#include <cctype>
++#include <cstdio>
++#include <cstring>
++#include <ctime>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include <rex/cvar.h>
+ #include <rex/logging.h>
++#include <rex/memory/utils.h>
++#include <rex/system/xam/user_profile.h>
++#include <rex/system/xlive.h>
+ #include <rex/thread.h>
+ 
++#include <fmt/format.h>
++#include <inja/third_party/include/nlohmann/json.hpp>
++
++REXCVAR_DECLARE(bool, net_log);
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+ using namespace rex::system;
+ using namespace rex::system::xam;
++bool XamFreeContaining(uint32_t address, uint32_t keep);  // xam_info.cpp
++
+ namespace apps {
+ using namespace rex::system;
+ 
+ XLiveBaseApp::XLiveBaseApp(KernelState* kernel_state) : App(kernel_state, 0xFC) {}
+ 
++namespace {
++
++namespace xlive = rex::system::xlive;
++using rex::memory::load_and_swap;
++using rex::memory::store_and_swap;
++
++constexpr X_HRESULT kOnlineLogonNotLoggedOn = 0x80151802;
++constexpr X_HRESULT kStorageFileIsTooBig = 0x8015C003;
++constexpr X_HRESULT kStorageFileNotFound = 0x8015C004;
++constexpr X_HRESULT kStorageInvalidStoragePath = 0x8015C008;
++constexpr X_HRESULT kStorageInvalidFacility = 0x8015C009;
++constexpr X_HRESULT kStorageFileNotModified = 0x0015C013;
++
++constexpr uint32_t kMaxPathnameLength = 255;  // X_ONLINE_MAX_PATHNAME_LENGTH
++constexpr uint32_t kMaxResultsToReturn = 256;  // X_STORAGE_MAX_RESULTS_TO_RETURN
++constexpr uint32_t kUserIndexNone = 0xFF;
++constexpr uint32_t kContentTypeStorageDownload = 0x000D0000;
++
++enum StorageFacility : uint32_t {
++  kFacilityGameClip = 1,     // Read, Write
++  kFacilityPerTitle = 2,     // Read, Enumerate
++  kFacilityPerUserTitle = 3  // Read, Write, Delete
++};
++
++// XStorageBuildServerPath arguments (message 0x58035, not marshalled).
++struct X_STORAGE_BUILD_SERVER_PATH {
++  be<uint32_t> user_index;
++  be<uint32_t> pad;
++  be<uint64_t> xuid;
++  be<uint32_t> storage_location;
++  be<uint32_t> storage_location_info_ptr;
++  be<uint32_t> storage_location_info_size;
++  be<uint32_t> file_name_ptr;
++  be<uint32_t> server_path_ptr;
++  be<uint32_t> server_path_length_ptr;
++};
++static_assert(sizeof(X_STORAGE_BUILD_SERVER_PATH) == 0x28);
++
++struct X_GET_TASK_PROGRESS {
++  be<uint32_t> overlapped_ptr;
++  be<uint32_t> percent_complete_ptr;
++  be<uint32_t> numerator_ptr;
++  be<uint32_t> denominator_ptr;
++};
++static_assert(sizeof(X_GET_TASK_PROGRESS) == 0x10);
++
++// Marshalled XLive tasks (the title's XOnline library, via XMsgStartIORequest):
++// the message buffer is an XLIVEBASE_ASYNC_MESSAGE whose first field points at
++// an XLIVE_ASYNC_TASK; the request arguments are serialized big-endian at
++// marshalled_request_ptr, and results go to results_ptr.
++struct XLIVE_ASYNC_TASK {
++  be<uint32_t> ordinal;
++  be<uint32_t> schema_data_ptr;
++  be<uint32_t> schema_index;
++  be<uint32_t> task_flags;
++  be<uint32_t> live_async_task_internal_ptr;
++  be<uint32_t> internal_task_size;
++  be<uint32_t> marshalled_request_ptr;
++  be<uint32_t> marshalled_request_size;
++  be<uint32_t> total_wire_buffer_size;
++  be<uint32_t> counter;
++  be<uint32_t> logon_id;
++  be<uint32_t> results_ptr;
++  be<uint32_t> results_size;
++  be<uint32_t> wire_buffer[5];
++  be<uint32_t> overlapped_ptr;
++};
++static_assert(sizeof(XLIVE_ASYNC_TASK) == 0x4C);
++
++// Packed result layouts (offsets as in xenia-netplay's xnet.h).
++// X_STORAGE_DOWNLOAD_TO_MEMORY_RESULTS
++constexpr uint32_t kDownloadResultsSize = 0x14;
++// X_STORAGE_ENUMERATE_RESULTS followed by X_STORAGE_FILE_INFO[] and paths
++constexpr uint32_t kEnumerateResultsSize = 0xC;
++constexpr uint32_t kFileInfoSize = 0x41;
++
++// Reads a marshalled request: user index, then the server path, then the
++// message's own fields.
++class MarshalledRequest {
++ public:
++  MarshalledRequest(memory::Memory* memory, uint32_t buffer_ptr) {
++    if (!buffer_ptr) {
++      return;
++    }
++    const uint32_t task_ptr = load_and_swap<uint32_t>(memory->TranslateVirtual(buffer_ptr));
++    if (!task_ptr) {
++      return;
++    }
++    task_ = memory->TranslateVirtual<XLIVE_ASYNC_TASK*>(task_ptr);
++    if (!task_->marshalled_request_ptr) {
++      task_ = nullptr;
++      return;
++    }
++    data_ = memory->TranslateVirtual<uint8_t*>(task_->marshalled_request_ptr);
++    size_ = task_->marshalled_request_size;
++  }
++
++  bool valid() const { return task_ != nullptr; }
++  bool overrun() const { return overrun_; }
++  size_t position() const { return position_; }
++  size_t size() const { return size_; }
++  uint32_t results_ptr() const { return task_ ? uint32_t(task_->results_ptr) : 0; }
++  uint32_t results_size() const { return task_ ? uint32_t(task_->results_size) : 0; }
++
++  uint32_t ReadU32() {
++    if (position_ + 4 > size_) {
++      overrun_ = true;
++      return 0;
++    }
++    const uint32_t v = load_and_swap<uint32_t>(data_ + position_);
++    position_ += 4;
++    return v;
++  }
++
++  uint16_t ReadU16() {
++    if (position_ + 2 > size_) {
++      overrun_ = true;
++      return 0;
++    }
++    const uint16_t v = load_and_swap<uint16_t>(data_ + position_);
++    position_ += 2;
++    return v;
++  }
++
++  void Skip(size_t count) {
++    if (position_ + count > size_) {
++      overrun_ = true;
++      position_ = size_;
++      return;
++    }
++    position_ += count;
++  }
++
++  // A counted UTF-16 string (the count includes the terminator).
++  std::string ReadPath(uint32_t length) {
++    std::string out;
++    if (position_ + size_t(length) * 2 > size_) {
++      overrun_ = true;
++      return out;
++    }
++    for (uint32_t i = 0; i < length; ++i) {
++      const uint16_t c = load_and_swap<uint16_t>(data_ + position_ + i * 2);
++      if (!c) {
++        break;
++      }
++      out += c < 0x80 ? char(c) : '?';
++    }
++    position_ += size_t(length) * 2;
++    return out;
++  }
++
++  // The fields common to every storage message.
++  bool ReadUserAndPath(uint32_t* user_index, std::string* path) {
++    *user_index = ReadU32();
++    const uint32_t length = ReadU32();
++    if (length > kMaxPathnameLength + 1) {
++      return false;
++    }
++    *path = ReadPath(length);
++    return !overrun_;
++  }
++
++ private:
++  XLIVE_ASYNC_TASK* task_ = nullptr;
++  uint8_t* data_ = nullptr;
++  size_t size_ = 0;
++  size_t position_ = 0;
++  bool overrun_ = false;
++};
++
++void WriteGuestString(uint8_t* dest, const std::string& text, uint32_t capacity_chars) {
++  if (!capacity_chars) {
++    return;
++  }
++  const uint32_t n = std::min<uint32_t>(uint32_t(text.size()), capacity_chars - 1);
++  for (uint32_t i = 0; i < n; ++i) {
++    store_and_swap<uint16_t>(dest + i * 2, uint16_t(uint8_t(text[i])));
++  }
++  store_and_swap<uint16_t>(dest + n * 2, 0);
++}
++
++std::string ReadGuestString(const uint8_t* src, uint32_t max_chars) {
++  std::string out;
++  for (uint32_t i = 0; i < max_chars; ++i) {
++    const uint16_t c = load_and_swap<uint16_t>(src + i * 2);
++    if (!c) {
++      break;
++    }
++    out += c < 0x80 ? char(c) : '?';
++  }
++  return out;
++}
++
++std::optional<uint64_t> ParseHexField(const std::string& s, size_t digits) {
++  if (s.size() != digits) {
++    return std::nullopt;
++  }
++  return xlive::ParseHex64(s);
++}
++
++// Guest server paths (the format XStorageBuildServerPath hands out, as in
++// xenia-netplay) and their HTTP paths on live_server:
++//   //title.<title>/t:<title>/<file>          -> /storage/title/<TITLE>/<file>
++//   //tuser.<title>/u:<xuid>/<title>/<file>   -> /storage/user/<XUID>/<TITLE>/<file>
++//   //xestats/u:<xuid>/<title>/<view>          -> /storage/clip/<TITLE>/<XUID>/<VIEW>
++// A path the title built itself ("/storage/...") is used as is.
++std::optional<std::string> GuestPathToHttp(const std::string& guest) {
++  if (guest.size() > 1 && guest[0] == '/' && guest[1] != '/') {
++    return guest;
++  }
++  auto split = [](const std::string& s, size_t count) {
++    std::vector<std::string> parts;
++    size_t pos = 0;
++    while (parts.size() + 1 < count) {
++      const size_t slash = s.find('/', pos);
++      if (slash == std::string::npos) {
++        break;
++      }
++      parts.push_back(s.substr(pos, slash - pos));
++      pos = slash + 1;
++    }
++    parts.push_back(s.substr(pos));
++    return parts;
++  };
++  if (guest.rfind("//title.", 0) == 0) {
++    // title.<t> / t:<t> / file
++    auto parts = split(guest.substr(2), 3);
++    if (parts.size() != 3 || parts[1].rfind("t:", 0) != 0 || parts[2].empty()) {
++      return std::nullopt;
++    }
++    auto title = ParseHexField(parts[0].substr(6), 8);
++    if (!title) {
++      return std::nullopt;
++    }
++    return fmt::format("/storage/title/{:08X}/{}", *title, parts[2]);
++  }
++  if (guest.rfind("//tuser.", 0) == 0) {
++    auto parts = split(guest.substr(2), 4);
++    if (parts.size() != 4 || parts[1].rfind("u:", 0) != 0 || parts[3].empty()) {
++      return std::nullopt;
++    }
++    auto title = ParseHexField(parts[0].substr(6), 8);
++    auto xuid = ParseHexField(parts[1].substr(2), 16);
++    if (!title || !xuid) {
++      return std::nullopt;
++    }
++    return fmt::format("/storage/user/{:016X}/{:08X}/{}", *xuid, *title, parts[3]);
++  }
++  if (guest.rfind("//xestats/", 0) == 0) {
++    auto parts = split(guest.substr(10), 3);
++    if (parts.size() != 3 || parts[0].rfind("u:", 0) != 0) {
++      return std::nullopt;
++    }
++    auto xuid = ParseHexField(parts[0].substr(2), 16);
++    auto title = ParseHexField(parts[1], 8);
++    auto view = ParseHexField(parts[2], 8);
++    if (!xuid || !title || !view) {
++      return std::nullopt;
++    }
++    return fmt::format("/storage/clip/{:08X}/{:016X}/{:08X}", *title, *xuid, *view);
++  }
++  return std::nullopt;
++}
++
++// Inverse of GuestPathToHttp, for enumeration results.
++std::string HttpPathToGuest(const std::string& http, bool facility_path) {
++  if (!facility_path) {
++    return http;
++  }
++  auto rest_after = [&](const std::string& prefix) -> std::optional<std::string> {
++    if (http.size() <= prefix.size() || http.compare(0, prefix.size(), prefix) != 0) {
++      return std::nullopt;
++    }
++    return http.substr(prefix.size());
++  };
++  if (auto rest = rest_after("/storage/title/"); rest && rest->size() > 9) {
++    const std::string title = rest->substr(0, 8);
++    std::string lower = title;
++    for (auto& c : lower) c = char(std::tolower(uint8_t(c)));
++    return fmt::format("//title.{}/t:{}/{}", lower, lower, rest->substr(9));
++  }
++  if (auto rest = rest_after("/storage/user/"); rest && rest->size() > 26) {
++    std::string xuid = rest->substr(0, 16);
++    std::string title = rest->substr(17, 8);
++    for (auto& c : xuid) c = char(std::tolower(uint8_t(c)));
++    for (auto& c : title) c = char(std::tolower(uint8_t(c)));
++    return fmt::format("//tuser.{}/u:{}/{}/{}", title, xuid, title, rest->substr(26));
++  }
++  return http;
++}
++
++std::string UrlEncode(const std::string& s) {
++  std::string out;
++  for (unsigned char c : s) {
++    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
++      out += char(c);
++    } else {
++      out += fmt::format("%{:02X}", c);
++    }
++  }
++  return out;
++}
++
++uint64_t UnixToFiletime(int64_t seconds) {
++  return uint64_t(seconds + 11644473600ll) * 10000000ull;
++}
++
++// "created"/"modified": unix seconds or an ISO 8601 UTC timestamp.
++uint64_t JsonTimeToFiletime(const nlohmann::json& value) {
++  if (value.is_number()) {
++    return UnixToFiletime(value.get<int64_t>());
++  }
++  if (value.is_string()) {
++    std::tm tm{};
++    const std::string text = value.get<std::string>();
++    if (std::sscanf(text.c_str(), "%d-%d-%dT%d:%d:%d", &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
++                    &tm.tm_hour, &tm.tm_min, &tm.tm_sec) >= 3) {
++      tm.tm_year -= 1900;
++      tm.tm_mon -= 1;
++      return UnixToFiletime(int64_t(timegm(&tm)));
++    }
++  }
++  return UnixToFiletime(int64_t(std::time(nullptr)));
++}
++
++void LogStorage(const char* method, const std::string& path, int status, size_t bytes) {
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: storage {} {} -> {} {}", method, path, status, bytes);
++  }
++}
++
++}  // namespace
++
+ // http://mb.mirage.org/bugzilla/xliveless/main.c
+ 
+ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                             uint32_t buffer_length) {
++  return Dispatch(message, buffer_ptr, buffer_length, nullptr);
++}
++
++X_HRESULT XLiveBaseApp::DispatchMessageAsync(uint32_t message, uint32_t buffer_ptr,
++                                             uint32_t buffer_length, uint32_t* extended_error) {
++  return Dispatch(message, buffer_ptr, buffer_length, extended_error);
++}
++
++X_HRESULT XLiveBaseApp::Dispatch(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
++                                 uint32_t* extended_error) {
++  // XLiveBase async requests (XStorage*, XStringVerify, ...) arrive as a
++  // message pointing at an XLIVE_ASYNC_TASK the title's XAPI allocated with
++  // XamAlloc. XAM frees it when the request completes; the title never does
++  // (Halo 3 leaked ~25 XStringVerify blocks a second until XamAlloc failed).
++  const bool async_task = message >= 0x00050008 && message <= 0x0005000C;
++  uint32_t task_ptr = 0, results_ptr = 0;
++  if (async_task && buffer_ptr) {
++    task_ptr = load_and_swap<uint32_t>(memory_->TranslateVirtual(buffer_ptr));
++    if (task_ptr) {
++      results_ptr = memory_->TranslateVirtual<XLIVE_ASYNC_TASK*>(task_ptr)->results_ptr;
++    }
++  }
++  const X_HRESULT result = DispatchTask(message, buffer_ptr, buffer_length, extended_error);
++  if (async_task) {
++    XamFreeContaining(task_ptr, results_ptr);
++    XamFreeContaining(buffer_ptr, results_ptr);
++  }
++  return result;
++}
++
++X_HRESULT XLiveBaseApp::DispatchTask(uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
++                                     uint32_t* extended_error) {
+   // NOTE: buffer_length may be zero or valid.
+   auto buffer = memory_->TranslateVirtual(buffer_ptr);
++  if (xlive::Enabled()) {
++    switch (message) {
++      case 0x00058003:
++        // XLiveBaseLogonGetHR: signed in to Live.
++        REXKRNL_DEBUG("XLiveBaseLogonGetHR({:08X}, {:08X})", buffer_ptr, buffer_length);
++        return X_E_SUCCESS;
++      case 0x00050008:
++        return XStorageDelete(buffer_ptr);
++      case 0x00050009:
++        return XStorageDownloadToMemory(buffer_ptr, extended_error);
++      case 0x0005000A:
++        return XStorageEnumerate(buffer_ptr, extended_error);
++      case 0x0005000B:
++        return XStorageUploadFromMemory(buffer_ptr);
++      case 0x0005000C:
++        return XStringVerify(buffer_ptr);
++      case 0x00058032:
++        return XOnlineGetTaskProgress(buffer_ptr);
++      case 0x00058035:
++        return XStorageBuildServerPath(buffer_ptr);
++      default:
++        break;
++    }
++  }
+   switch (message) {
+     case 0x00058004: {
+       // Called on startup, seems to just return a bool in the buffer.
+@@ -85,6 +495,354 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+   return X_E_FAIL;
+ }
+ 
++X_HRESULT XLiveBaseApp::XStorageBuildServerPath(uint32_t buffer_ptr) {
++  if (!buffer_ptr) {
++    return X_E_INVALIDARG;
++  }
++  auto* args = memory_->TranslateVirtual<X_STORAGE_BUILD_SERVER_PATH*>(buffer_ptr);
++  const uint32_t user_index = args->user_index;
++  uint64_t xuid = 0;
++  if (user_index == kUserIndexNone) {
++    xuid = args->xuid;
++  } else if (user_index < 4 && kernel_state_->user_profile()) {
++    xuid = kernel_state_->user_profile()->xuid();
++  } else {
++    return X_E_INVALIDARG;
++  }
++  if (!xuid) {
++    return user_index == kUserIndexNone ? X_E_INVALIDARG : kOnlineLogonNotLoggedOn;
++  }
++  if (!args->server_path_length_ptr) {
++    return X_E_INVALIDARG;
++  }
++  const std::string filename =
++      args->file_name_ptr
++          ? ReadGuestString(memory_->TranslateVirtual(args->file_name_ptr), kMaxPathnameLength)
++          : std::string();
++  const uint32_t title_id = kernel_state_->title_id();
++  std::string path;
++  switch (uint32_t(args->storage_location)) {
++    case kFacilityGameClip: {
++      if (!args->storage_location_info_ptr || args->storage_location_info_size != 4) {
++        return X_E_INVALIDARG;
++      }
++      const uint32_t view_id =
++          load_and_swap<uint32_t>(memory_->TranslateVirtual(args->storage_location_info_ptr));
++      path = fmt::format("//xestats/u:{:016x}/{:08x}/{:08x}", xuid, title_id, view_id);
++      break;
++    }
++    case kFacilityPerTitle:
++      if (args->storage_location_info_ptr || args->storage_location_info_size || filename.empty()) {
++        return X_E_INVALIDARG;
++      }
++      path = fmt::format("//title.{:08x}/t:{:08x}/{}", title_id, title_id, filename);
++      break;
++    case kFacilityPerUserTitle:
++      if (args->storage_location_info_ptr || args->storage_location_info_size || filename.empty()) {
++        return X_E_INVALIDARG;
++      }
++      path = fmt::format("//tuser.{:08x}/u:{:016x}/{:08x}/{}", title_id, xuid, title_id, filename);
++      break;
++    default:
++      return kStorageInvalidFacility;
++  }
++  // Lengths are in characters, including the terminator.
++  auto* length_ptr = memory_->TranslateVirtual(args->server_path_length_ptr);
++  const uint32_t needed = uint32_t(path.size()) + 1;
++  if (args->server_path_ptr) {
++    const uint32_t capacity = load_and_swap<uint32_t>(length_ptr);
++    if (capacity < needed) {
++      return X_E_INVALIDARG;
++    }
++    WriteGuestString(memory_->TranslateVirtual(args->server_path_ptr), path, capacity);
++  }
++  store_and_swap<uint32_t>(length_ptr, needed);
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: storage path {} -> {}", filename, path);
++  }
++  return X_E_SUCCESS;
++}
++
++X_HRESULT XLiveBaseApp::XStorageDownloadToMemory(uint32_t buffer_ptr, uint32_t* extended_error) {
++  // user index, path, buffer size, buffer
++  MarshalledRequest request(memory_, buffer_ptr);
++  uint32_t user_index;
++  std::string guest_path;
++  if (!request.valid() || !request.results_ptr() ||
++      request.results_size() < kDownloadResultsSize ||
++      !request.ReadUserAndPath(&user_index, &guest_path)) {
++    return X_E_INVALIDARG;
++  }
++  const uint32_t buffer_size = request.ReadU32();
++  const uint32_t buffer_address = request.ReadU32();
++  if (request.overrun() || !buffer_address) {
++    return X_E_INVALIDARG;
++  }
++  const auto http_path = GuestPathToHttp(guest_path);
++  if (!http_path) {
++    REXKRNL_WARN("xlive: storage download: unsupported path {}", guest_path);
++    return kStorageInvalidStoragePath;
++  }
++  auto* results = memory_->TranslateVirtual(request.results_ptr());
++  std::memset(results, 0, request.results_size());
++
++  const auto response = xlive::Request("GET", *http_path);
++  LogStorage("GET", *http_path, response.status, response.body.size());
++  auto fail = [extended_error](X_HRESULT extended) -> X_HRESULT {
++    // Titles expect X_ERROR_FUNCTION_FAILED with the reason as the extended
++    // error (e.g. 545107D1 on a missing file).
++    if (extended_error) {
++      *extended_error = extended;
++    }
++    return X_ERROR_FUNCTION_FAILED;
++  };
++  if (response.status == 404) {
++    return fail(kStorageFileNotFound);
++  }
++  if (!response.ok()) {
++    return fail(X_E_FAIL);
++  }
++  if (response.body.size() > buffer_size) {
++    REXKRNL_WARN("xlive: storage {} is {} bytes, buffer {}", *http_path, response.body.size(),
++                 buffer_size);
++    return fail(X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER));
++  }
++  std::memcpy(memory_->TranslateVirtual(buffer_address), response.body.data(),
++              response.body.size());
++  // The owner is only known for user and clip paths.
++  uint64_t owner = 0;
++  if (guest_path.rfind("//", 0) == 0) {
++    // Built by GuestPathToHttp, so the XUID is at a fixed offset.
++    if (http_path->rfind("/storage/user/", 0) == 0) {
++      owner = xlive::ParseHex64(http_path->substr(14, 16)).value_or(0);
++    } else if (http_path->rfind("/storage/clip/", 0) == 0) {
++      owner = xlive::ParseHex64(http_path->substr(23, 16)).value_or(0);
++    }
++  }
++  store_and_swap<uint32_t>(results + 0x0, uint32_t(response.body.size()));  // bytes_total
++  store_and_swap<uint64_t>(results + 0x4, owner);                           // xuid_owner
++  store_and_swap<uint64_t>(results + 0xC, UnixToFiletime(std::time(nullptr)));  // ft_created
++  return X_E_SUCCESS;
++}
++
++X_HRESULT XLiveBaseApp::XStorageUploadFromMemory(uint32_t buffer_ptr) {
++  // user index, path, buffer size, buffer
++  MarshalledRequest request(memory_, buffer_ptr);
++  uint32_t user_index;
++  std::string guest_path;
++  if (!request.valid() || !request.ReadUserAndPath(&user_index, &guest_path)) {
++    return X_E_INVALIDARG;
++  }
++  const uint32_t buffer_size = request.ReadU32();
++  const uint32_t buffer_address = request.ReadU32();
++  if (request.overrun() || (buffer_size && !buffer_address)) {
++    return X_E_INVALIDARG;
++  }
++  const auto http_path = GuestPathToHttp(guest_path);
++  if (!http_path) {
++    REXKRNL_WARN("xlive: storage upload: unsupported path {}", guest_path);
++    return kStorageInvalidStoragePath;
++  }
++  const std::string body(
++      buffer_size ? reinterpret_cast<const char*>(memory_->TranslateVirtual(buffer_address))
++                  : "",
++      buffer_size);
++  const auto response = xlive::Request("PUT", *http_path, body, "application/octet-stream");
++  LogStorage("PUT", *http_path, response.status, body.size());
++  if (response.status == 304) {
++    return kStorageFileNotModified;
++  }
++  if (response.status == 413) {
++    return kStorageFileIsTooBig;
++  }
++  return response.ok() ? X_E_SUCCESS : X_E_FAIL;
++}
++
++X_HRESULT XLiveBaseApp::XStorageDelete(uint32_t buffer_ptr) {
++  MarshalledRequest request(memory_, buffer_ptr);
++  uint32_t user_index;
++  std::string guest_path;
++  if (!request.valid() || !request.ReadUserAndPath(&user_index, &guest_path)) {
++    return X_E_INVALIDARG;
++  }
++  const auto http_path = GuestPathToHttp(guest_path);
++  if (!http_path) {
++    return kStorageInvalidStoragePath;
++  }
++  const auto response = xlive::Request("DELETE", *http_path);
++  LogStorage("DELETE", *http_path, response.status, 0);
++  if (response.status == 404) {
++    return kStorageFileNotFound;
++  }
++  return response.ok() ? X_E_SUCCESS : X_E_FAIL;
++}
++
++X_HRESULT XLiveBaseApp::XStorageEnumerate(uint32_t buffer_ptr, uint32_t* extended_error) {
++  // user index, path, starting index, max results
++  MarshalledRequest request(memory_, buffer_ptr);
++  uint32_t user_index;
++  std::string guest_path;
++  if (!request.valid() || !request.results_ptr() ||
++      !request.ReadUserAndPath(&user_index, &guest_path)) {
++    return X_E_INVALIDARG;
++  }
++  const uint32_t starting_index = request.ReadU32();
++  const uint32_t max_results = request.ReadU32();
++  if (request.overrun() || max_results > kMaxResultsToReturn ||
++      starting_index >= kMaxResultsToReturn) {
++    return X_E_INVALIDARG;
++  }
++  const uint32_t results_size = request.results_size();
++  const uint32_t item_space = kFileInfoSize + kMaxPathnameLength * 2;
++  const uint32_t capacity =
++      results_size > kEnumerateResultsSize ? (results_size - kEnumerateResultsSize) / item_space
++                                           : 0;
++  if (!capacity) {
++    return X_E_INVALIDARG;
++  }
++  const bool facility_path = guest_path.rfind("//", 0) == 0;
++  // Wildcards ("/*.bin") enumerate the directory; the server matches prefixes.
++  std::string prefix = guest_path;
++  if (const size_t star = prefix.find('*'); star != std::string::npos) {
++    prefix.resize(star);
++  }
++  std::optional<std::string> http_prefix;
++  if (facility_path && !prefix.empty() && prefix.back() == '/') {
++    // A directory: map it with a placeholder file name and strip it again.
++    http_prefix = GuestPathToHttp(prefix + "x");
++    if (http_prefix) {
++      http_prefix->pop_back();
++    }
++  } else {
++    http_prefix = GuestPathToHttp(prefix);
++  }
++  if (!http_prefix) {
++    REXKRNL_WARN("xlive: storage enumerate: unsupported path {}", guest_path);
++    return kStorageInvalidStoragePath;
++  }
++
++  const uint32_t results_ptr = request.results_ptr();
++  auto* results = memory_->TranslateVirtual(results_ptr);
++  std::memset(results, 0, results_size);
++
++  const std::string query = "/xlive/v1/storage/enumerate?path=" + UrlEncode(*http_prefix);
++  const auto response = xlive::Request("GET", query);
++  nlohmann::json items = nlohmann::json::array();
++  if (response.ok()) {
++    auto parsed = nlohmann::json::parse(response.body, nullptr, false);
++    if (!parsed.is_discarded() && parsed.contains("items") && parsed["items"].is_array()) {
++      items = parsed["items"];
++    }
++  }
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: storage ENUMERATE {} -> {} {} items", *http_prefix, response.status,
++                 items.size());
++  }
++  if (!response.ok()) {
++    if (extended_error) {
++      *extended_error = X_E_FAIL;
++    }
++    return X_ERROR_FUNCTION_FAILED;
++  }
++
++  const uint32_t max_items = std::min(capacity, max_results ? max_results : capacity);
++  const uint32_t items_ptr = results_ptr + kEnumerateResultsSize;
++  const uint32_t paths_ptr = items_ptr + capacity * kFileInfoSize;
++  uint32_t returned = 0;
++  for (size_t i = starting_index; i < items.size() && returned < max_items; ++i) {
++    const auto& item = items[i];
++    if (!item.is_object() || !item.contains("path") || !item["path"].is_string()) {
++      continue;
++    }
++    std::string path = item["path"].get<std::string>();
++    if (path.rfind("/storage/", 0) != 0) {
++      path = (path.rfind('/', 0) == 0 ? "/storage" : "/storage/") + path;
++    }
++    const std::string guest_item = HttpPathToGuest(path, facility_path);
++    const uint32_t size =
++        item.contains("size") && item["size"].is_number() ? item["size"].get<uint32_t>() : 0;
++    const uint64_t created =
++        JsonTimeToFiletime(item.contains("created") ? item["created"] : nlohmann::json());
++    const uint64_t modified =
++        item.contains("modified") ? JsonTimeToFiletime(item["modified"]) : created;
++    const uint32_t path_address = paths_ptr + returned * kMaxPathnameLength * 2;
++    WriteGuestString(memory_->TranslateVirtual(path_address), guest_item, kMaxPathnameLength);
++
++    uint8_t* info = memory_->TranslateVirtual(items_ptr + returned * kFileInfoSize);
++    store_and_swap<uint32_t>(info + 0x00, kernel_state_->title_id());  // title_id
++    store_and_swap<uint32_t>(info + 0x04, 0);                          // title_version
++    store_and_swap<uint64_t>(info + 0x08, 0);                          // owner_puid
++    info[0x10] = 0;                                                    // country_id
++    store_and_swap<uint64_t>(info + 0x11, 0);                          // reserved
++    store_and_swap<uint32_t>(info + 0x19, kContentTypeStorageDownload);
++    store_and_swap<uint32_t>(info + 0x1D, size);  // storage_size
++    store_and_swap<uint32_t>(info + 0x21, size);  // installed_size
++    store_and_swap<uint64_t>(info + 0x25, created);
++    store_and_swap<uint64_t>(info + 0x2D, modified);
++    store_and_swap<uint16_t>(info + 0x35, 0);  // attributes_size
++    store_and_swap<uint16_t>(info + 0x37,
++                             uint16_t(std::min<size_t>(guest_item.size(), kMaxPathnameLength - 1)));
++    store_and_swap<uint32_t>(info + 0x39, path_address);
++    store_and_swap<uint32_t>(info + 0x3D, 0);  // attributes_ptr
++    ++returned;
++  }
++  store_and_swap<uint32_t>(results + 0x0, uint32_t(items.size()));  // total_num_items
++  store_and_swap<uint32_t>(results + 0x4, returned);                // num_items_returned
++  store_and_swap<uint32_t>(results + 0x8, items_ptr);
++  return X_E_SUCCESS;
++}
++
++X_HRESULT XLiveBaseApp::XStringVerify(uint32_t buffer_ptr) {
++  // title id, flags, locale length, string count, locale, then per string a
++  // length and UTF-8 bytes. Every string passes (no offensive-string filter);
++  // Halo 3 retries until this succeeds once online.
++  MarshalledRequest request(memory_, buffer_ptr);
++  if (!request.valid() || !request.results_ptr()) {
++    return X_E_INVALIDARG;
++  }
++  request.ReadU32();  // title id
++  request.ReadU32();  // flags
++  const uint16_t locale_size = request.ReadU16();
++  const uint16_t num_strings = request.ReadU16();
++  request.Skip(locale_size);
++  for (uint16_t i = 0; i < num_strings && !request.overrun(); ++i) {
++    request.Skip(request.ReadU16());
++  }
++  // STRING_VERIFY_RESPONSE (packed: u16 count, u32 results pointer) followed
++  // by one HRESULT per string.
++  constexpr uint32_t kResponseSize = 6;
++  const uint32_t results_ptr = request.results_ptr();
++  if (request.overrun() || request.results_size() < kResponseSize + num_strings * 4u) {
++    return X_E_INVALIDARG;
++  }
++  auto* results = memory_->TranslateVirtual(results_ptr);
++  std::memset(results, 0, request.results_size());
++  store_and_swap<uint16_t>(results + 0, num_strings);
++  store_and_swap<uint32_t>(results + 2, results_ptr + kResponseSize);
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: XStringVerify {} strings -> ok", num_strings);
++  }
++  return X_E_SUCCESS;
++}
++
++X_HRESULT XLiveBaseApp::XOnlineGetTaskProgress(uint32_t buffer_ptr) {
++  // Every task above completes before XMsgStartIORequest returns.
++  if (!buffer_ptr) {
++    return X_E_INVALIDARG;
++  }
++  auto* progress = memory_->TranslateVirtual<X_GET_TASK_PROGRESS*>(buffer_ptr);
++  if (progress->percent_complete_ptr) {
++    store_and_swap<uint32_t>(memory_->TranslateVirtual(progress->percent_complete_ptr), 100);
++  }
++  if (progress->numerator_ptr) {
++    store_and_swap<uint64_t>(memory_->TranslateVirtual(progress->numerator_ptr), 100);
++  }
++  if (progress->denominator_ptr) {
++    store_and_swap<uint64_t>(memory_->TranslateVirtual(progress->denominator_ptr), 100);
++  }
++  return X_E_SUCCESS;
++}
++
+ }  // namespace apps
+ }  // namespace xam
+ }  // namespace kernel
+diff --git a/src/kernel/xam/xam_enum.cpp b/src/kernel/xam/xam_enum.cpp
+index 9dcab94..b716d92 100644
+--- a/src/kernel/xam/xam_enum.cpp
++++ b/src/kernel/xam/xam_enum.cpp
+@@ -10,6 +10,10 @@
+  */
+ 
+ #include <rex/kernel/xam/module.h>
++
++#include <cstring>
++
++#include <rex/cvar.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+ #include <rex/hook.h>
+@@ -17,6 +21,7 @@
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xenumerator.h>
++#include <rex/system/xlive.h>
+ #include <rex/system/xtypes.h>
+ 
+ #if REX_PLATFORM_WIN32
+@@ -25,6 +30,8 @@
+ 
+ #include <fmt/format.h>
+ 
++REXCVAR_DECLARE(bool, net_log);
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -83,8 +90,71 @@ u32 XamEnumerate_entry(u32 handle, u32 flags, mapped_void buffer, u32 buffer_len
+   return result;
+ }
+ 
+-u32 XamCreateEnumeratorHandle_entry(u32 unk1, u32 unk2, u32 unk3, u32 unk4, u32 unk5, u32 unk6,
+-                                    u32 unk7, u32 unk8) {
++namespace {
++
++// XTitleServerCreateEnumerator: the title's LSP (title server) list.
++constexpr uint32_t kTitleServerMessage = 0x58039;
++constexpr uint32_t kTitleServerMaxLspInfo = 1000;  // X_TITLE_SERVER_MAX_LSP_INFO
++
++struct X_TITLE_SERVER {
++  be<uint32_t> server_address;  // IN_ADDR
++  be<uint32_t> flags;
++  char server_description[200];
++};
++static_assert(sizeof(X_TITLE_SERVER) == 0xD0);
++
++// With live_server, the one title server is live_server itself: it serves the
++// title's web services (Halo 3: Bungie's) on port 36080, where the title's
++// port 80 connections land. The description lists the services the server
++// offers, comma-separated; Halo 3 picks a server per service by these tokens
++// (ttl: title storage, usr: user storage, shr: file share, web: web services).
++constexpr char kTitleServerDescription[] = "bungie,ttl,usr,shr,web";
++uint32_t XTitleServerCreateEnumerator(uint32_t user_index, uint32_t app_id, uint32_t open_message,
++                                      uint32_t close_message, uint32_t extra_size,
++                                      uint32_t item_count, uint32_t flags, uint32_t* out_handle) {
++  if (item_count > kTitleServerMaxLspInfo) {
++    return X_ERROR_INVALID_PARAMETER;
++  }
++  auto e =
++      make_object<XStaticEnumerator<X_TITLE_SERVER>>(REX_KERNEL_STATE(), item_count ? item_count : 1);
++  auto result =
++      e->Initialize(user_index, app_id, open_message, close_message, flags, extra_size, nullptr);
++  if (XFAILED(result)) {
++    return result;
++  }
++  const uint32_t ip = rex::system::xlive::ServerAddress();
++  if (ip) {
++    X_TITLE_SERVER* item = e->AppendItem();
++    std::memset(item, 0, sizeof(*item));
++    item->server_address = ip;
++    item->flags = 0;
++    std::strncpy(item->server_description, kTitleServerDescription,
++                 sizeof(item->server_description) - 1);
++  }
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: title servers: {} ({}.{}.{}.{})", e->item_count(), ip >> 24,
++                 (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
++  }
++  *out_handle = e->handle();
++  return X_ERROR_SUCCESS;
++}
++
++}  // namespace
++
++// XamCreateEnumeratorHandle(user_index, app_id, open_message, close_message,
++//                           extra_size, item_count, flags, out_handle)
++u32 XamCreateEnumeratorHandle_entry(u32 user_index, u32 app_id, u32 open_message,
++                                    u32 close_message, u32 extra_size, u32 item_count, u32 flags,
++                                    mapped_u32 out_handle) {
++  if (rex::system::xlive::Enabled() && open_message == kTitleServerMessage && out_handle) {
++    uint32_t handle = 0;
++    const uint32_t result = XTitleServerCreateEnumerator(
++        user_index, app_id, open_message, close_message, extra_size, item_count, flags, &handle);
++    if (result == X_ERROR_SUCCESS) {
++      *out_handle = handle;
++    }
++    return result;
++  }
+   return X_ERROR_INVALID_PARAMETER;
+ }
+ 
 diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
-index 1fda053..96b9ccf 100644
+index 1fda053..177dc96 100644
 --- a/src/kernel/xam/xam_info.cpp
 +++ b/src/kernel/xam/xam_info.cpp
-@@ -9,6 +9,8 @@
+@@ -9,6 +9,9 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
++#include <map>
 +#include <mutex>
 +#include <unordered_set>
  #include <rex/kernel/xam/module.h>
  #include <rex/kernel/xam/private.h>
  #include <rex/logging.h>
-@@ -293,20 +295,44 @@ void XamLoaderTerminateTitle_entry() {
+@@ -293,20 +296,68 @@ void XamLoaderTerminateTitle_entry() {
    REX_KERNEL_STATE()->TerminateTitle();
  }
  
@@ -269709,7 +271767,7 @@ index 1fda053..96b9ccf 100644
 +// released when XAM is done with them - see XamTaskSchedule.
 +namespace {
 +std::mutex xam_alloc_mutex;
-+std::unordered_set<uint32_t> xam_alloc_live;
++std::map<uint32_t, uint32_t> xam_alloc_live;  // address -> size
 +}  // namespace
 +
 +bool XamFreeIfAllocated(uint32_t ptr) {
@@ -269723,6 +271781,30 @@ index 1fda053..96b9ccf 100644
 +  return true;
 +}
  
++// Frees the XamAlloc block that contains `address`, if any - unless it also
++// contains `keep` (e.g. results the title reads after completion).
++bool XamFreeContaining(uint32_t address, uint32_t keep) {
++  uint32_t ptr = 0;
++  {
++    std::lock_guard<std::mutex> lock(xam_alloc_mutex);
++    auto it = xam_alloc_live.upper_bound(address);
++    if (!address || it == xam_alloc_live.begin()) {
++      return false;
++    }
++    --it;
++    if (address >= it->first + it->second) {
++      return false;
++    }
++    if (keep >= it->first && keep < it->first + it->second) {
++      return false;
++    }
++    ptr = it->first;
++    xam_alloc_live.erase(it);
++  }
++  REX_KERNEL_MEMORY()->SystemHeapFree(ptr);
++  return true;
++}
++
 +u32 XamAlloc_entry(u32 flags, u32 size, mapped_u32 out_ptr) {
    // Allocate from the heap. Not sure why XAM does this specially, perhaps
    // it keeps stuff in a separate heap?
@@ -269736,7 +271818,7 @@ index 1fda053..96b9ccf 100644
 +    return 0x8007000E;  // E_OUTOFMEMORY
 +  }
 +  std::lock_guard<std::mutex> lock(xam_alloc_mutex);
-+  xam_alloc_live.insert(ptr);
++  xam_alloc_live[ptr] = uint32_t(size);
    return X_ERROR_SUCCESS;
  }
  
@@ -269749,8 +271831,57 @@ index 1fda053..96b9ccf 100644
    return X_ERROR_SUCCESS;
  }
  
+diff --git a/src/kernel/xam/xam_misc.cpp b/src/kernel/xam/xam_misc.cpp
+index ff6cb56..a7b6b87 100644
+--- a/src/kernel/xam/xam_misc.cpp
++++ b/src/kernel/xam/xam_misc.cpp
+@@ -237,13 +237,11 @@ REX_EXPORT_STUB(__imp__XNetLogonGetExtendedStatus);
+ REX_EXPORT_STUB(__imp__XNetLogonGetFlowToken);
+ REX_EXPORT_STUB(__imp__XNetLogonGetLastUPnPStatus);
+ REX_EXPORT_STUB(__imp__XNetLogonGetLoggedOnUsers);
+-REX_EXPORT_STUB(__imp__XNetLogonGetMachineID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetNatType);
+ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
+ REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetState);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
+-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
+ REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
+ REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
+diff --git a/src/kernel/xam/xam_msg.cpp b/src/kernel/xam/xam_msg.cpp
+index 704eb0c..a38968f 100644
+--- a/src/kernel/xam/xam_msg.cpp
++++ b/src/kernel/xam/xam_msg.cpp
+@@ -54,15 +54,23 @@ struct XMSGSTARTIOREQUEST_UNKNOWNARG {
+ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
+                                  uint32_t buffer_ptr, uint32_t buffer_length,
+                                  XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
+-  auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
+-                                                                        buffer_length);
++  uint32_t extended_error = X_E_SUCCESS;
++  auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(
++      app, message, buffer_ptr, buffer_length, &extended_error);
+   if (result == X_E_NOTFOUND) {
+     REXKRNL_ERROR("XMsgStartIORequestEx: app {:08X} undefined", app);
+     result = X_E_INVALIDARG;
+     XThread::SetLastError(X_ERROR_NOT_FOUND);
+   }
+   if (overlapped_ptr) {
+-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr, result);
++    // Apps that don't set an extended error report the result there.
++    if (extended_error == X_E_SUCCESS) {
++      extended_error = result;
++    }
++    // Games check 'length' as an indication of success (see
++    // CompleteOverlappedImmediate).
++    REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(overlapped_ptr, result, extended_error,
++                                                      !result ? 0 : 0xFFFFFFFF);
+     result = X_ERROR_IO_PENDING;
+   }
+   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {
 diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
-index 58e36a4..8eab53b 100644
+index 58e36a4..7666962 100644
 --- a/src/kernel/xam/xam_net.cpp
 +++ b/src/kernel/xam/xam_net.cpp
 @@ -12,13 +12,21 @@
@@ -269775,7 +271906,17 @@ index 58e36a4..8eab53b 100644
  #include <rex/kernel/xam/module.h>
  #include <rex/kernel/xam/private.h>
  #include <rex/kernel/xboxkrnl/error.h>
-@@ -42,8 +50,12 @@
+@@ -29,6 +37,9 @@
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xevent.h>
++#include <rex/system/xlive.h>
++
++#include "apps/xgi_live.h"
+ #include <rex/system/xsocket.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
+@@ -42,8 +53,12 @@
  #include <netinet/in.h>
  #include <netinet/ip.h>
  #include <sys/socket.h>
@@ -269788,7 +271929,7 @@ index 58e36a4..8eab53b 100644
  namespace rex {
  namespace kernel {
  namespace xam {
-@@ -231,9 +243,15 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
+@@ -231,9 +246,15 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
  }
  
  u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
@@ -269807,33 +271948,22 @@ index 58e36a4..8eab53b 100644
  
    return 0;
  }
-@@ -435,28 +453,28 @@ struct XnAddrStatus {
+@@ -435,28 +456,34 @@ struct XnAddrStatus {
    static const uint32_t XNET_GET_XNADDR_TROUBLESHOOT = 0x00008000;
  };
  
+-u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+-  // Just return a loopback address atm.
+-  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+-  addr_ptr->inaOnline.s_addr = 0;
+-  addr_ptr->wPortOnline = 0;
 +namespace {
 +
 +// XNADDRs the title handed to XNetXnAddrToInAddr, by IP (host byte order), so
 +// XNetInAddrToXnAddr can give them back.
 +std::mutex xnaddr_mutex;
 +std::unordered_map<uint32_t, XNADDR> known_xnaddrs;
-+
-+// A stable, per-address MAC: instances on one PC (127.0.0.N) differ.
-+void FillXnAddr(XNADDR* addr, uint32_t ip) {
-+  std::memset(addr, 0, sizeof(*addr));
-+  addr->ina.s_addr = htonl(ip);
-+  const uint8_t enet[6] = {0x00, 0x1D, 0xD8, uint8_t(ip >> 16), uint8_t(ip >> 8), uint8_t(ip)};
-+  std::memcpy(addr->abEnet, enet, sizeof(enet));
-+}
-+
-+}  // namespace
-+
- u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
--  // Just return a loopback address atm.
--  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
--  addr_ptr->inaOnline.s_addr = 0;
--  addr_ptr->wPortOnline = 0;
--
+ 
 -  // TODO(gibbed): A proper mac address.
 -  // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
 -  // numbers. A zero value will cause RakPeer::Startup to fail. This causes
@@ -269846,18 +271976,33 @@ index 58e36a4..8eab53b 100644
 -  // "Mac address is a poor solution because you can't have multiple connections
 -  // from the same system"
 -  std::memset(addr_ptr->abEnet, 0xCC, 6);
--
++// A stable, per-address MAC: instances on one PC (127.0.0.N) differ.
++void FillXnAddr(XNADDR* addr, uint32_t ip) {
++  std::memset(addr, 0, sizeof(*addr));
++  addr->ina.s_addr = htonl(ip);
++  const uint8_t enet[6] = {0x00, 0x1D, 0xD8, uint8_t(ip >> 16), uint8_t(ip >> 8), uint8_t(ip)};
++  std::memcpy(addr->abEnet, enet, sizeof(enet));
++}
+ 
 -  std::memset(addr_ptr->abOnline, 0, 20);
--
++}  // namespace
+ 
 -  return XnAddrStatus::XNET_GET_XNADDR_STATIC;
++u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
 +  // System link only: the address is this instance's LAN (or 127.0.0.N) IP.
 +  // RakNet-based titles (58411436) need a non-zero abEnet.
 +  FillXnAddr(addr_ptr, xnet::LocalAddress());
-+  return XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_ETHERNET;
++  uint32_t status = XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_ETHERNET;
++  if (xlive::Enabled()) {
++    // Logged on to (the stand-in for) Xbox Live: titles only use Live
++    // services (Halo 3: title servers, online files) when this is set.
++    status |= XnAddrStatus::XNET_GET_XNADDR_ONLINE;
++  }
++  return status;
  }
  
  u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-@@ -467,33 +485,82 @@ u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+@@ -467,33 +494,82 @@ u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
  }
  
  u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u32 id_ptr) {
@@ -269947,7 +272092,7 @@ index 58e36a4..8eab53b 100644
  }
  
  // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
-@@ -506,9 +573,64 @@ struct XEthernetStatus {
+@@ -506,9 +582,99 @@ struct XEthernetStatus {
  };
  
  u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
@@ -269966,20 +272111,20 @@ index 58e36a4..8eab53b 100644
 +  }
 +  NetDll_XNetRandom_entry(caller, xnkid, 8);
 +  NetDll_XNetRandom_entry(caller, xnkey, 16);
-+  // XNKID_SYSTEM_LINK: the top three bits of the first byte are zero.
-+  static_cast<uint8_t*>(xnkid)[0] &= 0x1F;
-   return 0;
- }
- 
++  // XNKID_SYSTEM_LINK: the top nibble of the first byte is zero.
++  static_cast<uint8_t*>(xnkid)[0] &= 0x0F;
++  return 0;
++}
++
 +// Keys and security associations only matter to XNet's encryption, which
 +// instances don't use; all of these succeed.
 +u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
 +  if (REXCVAR_GET(net_log)) {
 +    REXKRNL_INFO("net: XNetRegisterKey");
 +  }
-+  return 0;
-+}
-+
+   return 0;
+ }
+ 
 +u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void xnkid) {
 +  if (REXCVAR_GET(net_log)) {
 +    REXKRNL_INFO("net: XNetUnregisterKey");
@@ -270009,13 +272154,89 @@ index 58e36a4..8eab53b 100644
 +  return 2;  // XNET_CONNECT_STATUS_CONNECTED
 +}
 +
++// XNetServerToInAddr(IN_ADDR inaServer, DWORD dwServiceId, IN_ADDR* pina):
++// a title server (from the title-server enumeration) to an address sockets can
++// use. Like XNetXnAddrToInAddr this is a secure IN_ADDR; TCP connects to it go
++// to live_server's port, whichever service port the title uses (Halo 3: 1001,
++// 1002).
++u32 NetDll_XNetServerToInAddr_entry(u32 caller, u32 server_addr, u32 service_id,
++                                    mapped_void in_addr) {
++  if (!xlive::Enabled()) {
++    REXKRNL_WARN("__imp__NetDll_XNetServerToInAddr STUB");
++    return caller;  // as the stub: r3 unchanged
++  }
++  if (!server_addr || !in_addr) {
++    return 0x2726;  // WSAEINVAL
++  }
++  const uint32_t ip = uint32_t(server_addr);  // big-endian register value == host order
++  const uint32_t secure = xnet::SecureFromIp(ip, true);
++  xnet::MarkTitleServer(secure);
++  rex::memory::store_and_swap<uint32_t>(static_cast<uint8_t*>(in_addr), secure);
++  if (REXCVAR_GET(net_log)) {
++    REXKRNL_INFO("xlive: XNetServerToInAddr {}.{}.{}.{} service {:08X} -> {:#010x}", ip >> 24,
++                 (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF, uint32_t(service_id), secure);
++  }
++  return 0;
++}
++
++// XNetLogonGetTitleID(): the title logged on to Live. Halo 3 polls it once
++// online.
++u32 XNetLogonGetTitleID_entry(u32 r3) {
++  if (!xlive::Enabled()) {
++    REXKRNL_WARN("__imp__XNetLogonGetTitleID STUB");
++    return r3;  // as the stub: r3 unchanged
++  }
++  return REX_KERNEL_STATE()->title_id();
++}
++
  u32 NetDll_XNetDnsLookup_entry(u32 caller, mapped_string host, u32 event_handle, mapped_u32 pdns) {
    // TODO(gibbed): actually implement this
    if (pdns) {
-@@ -549,17 +671,356 @@ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, m
-   return 0;
+@@ -534,18 +700,392 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
  }
  
+ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
+-  // Set pqos as some games will try accessing it despite non-successful result
++  // QoS to the Xbox LIVE data center. Signed in to the Live stand-in, report
++  // one contacted service with a good connection: Halo 3 measures this while
++  // setting up a match. Offline (or on allocation failure) report none, and
++  // never write through a null result (it used to, once the heap ran out,
++  // and every frame's lookup then took the slow access-violation path).
+   if (pqos) {
+-    auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
+-    auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
+-    qos->count = qos->count_pending = 0;
++    *pqos = 0;
++    const uint32_t qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
++    if (!qos_guest) {
++      return 0x8007000E;  // E_OUTOFMEMORY
++    }
++    auto* qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
++    std::memset(qos, 0, sizeof(XNQOS));
++    if (rex::system::xlive::Enabled()) {
++      qos->count = 1;
++      XNQOSINFO& info = qos->info[0];
++      info.flags = 0x01 | 0x02;  // complete, target contacted
++      info.probes_xmit = 4;
++      info.probes_recv = 4;
++      info.rtt_min_in_msecs = 10;
++      info.rtt_med_in_msecs = 10;
++      info.up_bits_per_sec = 10000000;
++      info.down_bits_per_sec = 10000000;
++    }
+     *pqos = qos_guest;
+   }
+   if (event_handle) {
+-    auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+-    assert_not_null(ev);
+-    ev->Set(0, false);
++    if (auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle)) {
++      ev->Set(0, false);
++    }
++  }
++  return 0;
++}
++
 +// ---------------------------------------------------------------------------
 +// QoS. Before joining, titles probe the host with XNetQosLookup; the host's
 +// reply carries the data it published with XNetQosListen (Halo 3 refuses to
@@ -270117,13 +272338,28 @@ index 58e36a4..8eab53b 100644
 +        header.enabled = 1;
 +        header.data_len = uint16_t(it->second.data.size());
 +        reply.insert(reply.end(), it->second.data.begin(), it->second.data.end());
++      } else if (it != qos_listeners.end()) {
++        // A session member that switched its listener off (Halo 3 joiners do
++        // for the session they joined) still answers as reachable, without
++        // data: members probe each other to check the peer mesh, and a
++        // "disabled" answer made the host evict them.
++        header.enabled = 1;
++        header.data_len = 0;
 +      }
 +    }
 +    std::memcpy(reply.data(), &header, sizeof(header));
 +    sendto(fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr*>(&from), from_len);
 +    if (REXCVAR_GET(net_log)) {
-+      REXKRNL_INFO("net: QoS probe from {} -> {}", inet_ntoa(from.sin_addr),
-+                   header.enabled ? "listening" : "not listening");
++      std::string keys;
++      {
++        std::lock_guard<std::mutex> lock(qos_mutex);
++        for (const auto& [k, l] : qos_listeners) {
++          keys += fmt::format(" {:016X}{}", rex::byte_swap(k), l.enabled ? "" : "(off)");
++        }
++      }
++      REXKRNL_INFO("net: QoS probe from {} for {:016X} -> {} (listening:{})",
++                   inet_ntoa(from.sin_addr), rex::byte_swap(LoadXnkid(probe.xnkid)),
++                   header.enabled ? "listening" : "not listening", keys);
 +    }
 +  }
 +}
@@ -270149,7 +272385,9 @@ index 58e36a4..8eab53b 100644
 +    qos_listeners.erase(xnkid);
 +    return 0;
 +  }
++  const bool is_new = !qos_listeners.count(xnkid);
 +  QosListener& listener = qos_listeners[xnkid];
++  const bool was_enabled = listener.enabled;
 +  if (flags & kQosListenSetData) {
 +    const uint8_t* bytes = data;
 +    const uint32_t size = std::min<uint32_t>(data_size, kQosMaxData);
@@ -270161,9 +272399,16 @@ index 58e36a4..8eab53b 100644
 +  if (flags & kQosListenDisable) {
 +    listener.enabled = false;
 +  }
++  if (is_new || listener.enabled != was_enabled) {
++    const bool enabled = listener.enabled;
++    // Report outside qos_mutex (it makes an HTTP call).
++    std::thread([ks = REX_KERNEL_STATE(), key = rex::byte_swap(xnkid), enabled] {
++      xgi_live::OnQosListen(ks, key, enabled);
++    }).detach();
++  }
 +  if (REXCVAR_GET(net_log)) {
-+    REXKRNL_INFO("net: XNetQosListen flags {:#x}, {} bytes, enabled {}", uint32_t(flags),
-+                 listener.data.size(), listener.enabled);
++    REXKRNL_INFO("net: XNetQosListen {:016X} flags {:#x}, {} bytes, enabled {}",
++                 rex::byte_swap(xnkid), uint32_t(flags), listener.data.size(), listener.enabled);
 +  }
 +  return 0;
 +}
@@ -270223,7 +272468,7 @@ index 58e36a4..8eab53b 100644
 +  object_ref<XEvent> event;
 +  if (event_handle) {
 +    event = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
-+  }
+   }
 +  std::thread([memory, guest, header_size, targets, event]() {
 +    int fd = socket(AF_INET, SOCK_DGRAM, 0);
 +    if (xnet::LoopbackMode()) {
@@ -270344,10 +272589,10 @@ index 58e36a4..8eab53b 100644
 +      event->Set(0, false);
 +    }
 +  }).detach();
-+  return 0;
-+}
-+
- u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+   return 0;
+ }
+ 
+@@ -553,13 +1093,21 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
    if (!qos) {
      return X_STATUS_INVALID_PARAMETER;
    }
@@ -270372,7 +272617,7 @@ index 58e36a4..8eab53b 100644
  }
  
  u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
-@@ -620,12 +1081,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
+@@ -620,12 +1168,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
  
    auto ret = socket->Shutdown(how);
    if (ret == -1) {
@@ -270386,7 +272631,7 @@ index 58e36a4..8eab53b 100644
    }
    return ret;
  }
-@@ -640,7 +1096,11 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+@@ -640,7 +1183,11 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
    }
  
    X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
@@ -270399,7 +272644,7 @@ index 58e36a4..8eab53b 100644
  }
  
  u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
-@@ -653,7 +1113,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
+@@ -653,7 +1200,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
  
    X_STATUS status = socket->IOControl(cmd, arg_ptr);
    if (XFAILED(status)) {
@@ -270408,7 +272653,7 @@ index 58e36a4..8eab53b 100644
      return -1;
    }
  
-@@ -672,7 +1132,7 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+@@ -672,7 +1219,7 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
    N_XSOCKADDR_IN native_name(name);
    X_STATUS status = socket->Bind(&native_name, namelen);
    if (XFAILED(status)) {
@@ -270417,16 +272662,22 @@ index 58e36a4..8eab53b 100644
      return -1;
    }
  
-@@ -690,7 +1150,7 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+@@ -690,7 +1237,13 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
    N_XSOCKADDR native_name(name);
    X_STATUS status = socket->Connect(&native_name, namelen);
    if (XFAILED(status)) {
 -    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
-+    XThread::SetLastError(xnet::LastWsaError());
++    uint32_t error = xnet::LastWsaError();
++    // A non-blocking connect in progress is WSAEWOULDBLOCK on Winsock (the
++    // host's EINPROGRESS); titles treat anything else as a failed connect.
++    if (error == 10036) {  // WSAEINPROGRESS
++      error = 10035;       // WSAEWOULDBLOCK
++    }
++    XThread::SetLastError(error);
      return -1;
    }
  
-@@ -707,7 +1167,7 @@ u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
+@@ -707,7 +1260,7 @@ u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
  
    X_STATUS status = socket->Listen(backlog);
    if (XFAILED(status)) {
@@ -270435,7 +272686,7 @@ index 58e36a4..8eab53b 100644
      return -1;
    }
  
-@@ -816,17 +1276,35 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+@@ -816,17 +1369,35 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
      host_exceptfds.Load(exceptfds);
      host_exceptfds.Store(&native_exceptfds);
    }
@@ -270473,7 +272724,7 @@ index 58e36a4..8eab53b 100644
    if (readfds) {
      host_readfds.UpdateFrom(&native_readfds);
      host_readfds.Store(readfds);
-@@ -852,7 +1330,11 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -852,7 +1423,11 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -270486,7 +272737,7 @@ index 58e36a4..8eab53b 100644
  }
  
  u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
-@@ -884,12 +1366,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+@@ -884,12 +1459,7 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
  
    if (ret == -1) {
  // TODO: Better way of getting the error code
@@ -270500,7 +272751,7 @@ index 58e36a4..8eab53b 100644
    }
  
    return ret;
-@@ -903,7 +1380,11 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
+@@ -903,7 +1473,11 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
      return -1;
    }
  
@@ -270513,7 +272764,7 @@ index 58e36a4..8eab53b 100644
  }
  
  u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
-@@ -916,7 +1397,53 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+@@ -916,7 +1490,63 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
    }
  
    N_XSOCKADDR_IN native_to(to_ptr);
@@ -270565,13 +272816,33 @@ index 58e36a4..8eab53b 100644
 +    *namelen = sizeof(XSOCKADDR_IN);
 +  }
 +  return 0;
++}
++
++// Machine identity for Live (arbitration registers machines, not users):
++// derived from this instance's address, as XNetXnAddrToMachineId is.
++u32 XNetLogonGetMachineID_entry(mapped_u64 machine_id) {
++  if (!machine_id) {
++    return X_E_INVALIDARG;
++  }
++  *machine_id = rex::system::xlive::MachineId();
++  return 0;
  }
  
  u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
-@@ -985,6 +1512,16 @@ REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
+@@ -964,6 +1594,8 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
+ REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
+            rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
+ REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
++REX_EXPORT(__imp__NetDll_XNetServerToInAddr, rex::kernel::xam::NetDll_XNetServerToInAddr_entry)
++REX_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
+ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
+@@ -985,6 +1617,17 @@ REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
  REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
  REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
  REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
++REX_EXPORT(__imp__XNetLogonGetMachineID, rex::kernel::xam::XNetLogonGetMachineID_entry)
 +REX_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
 +REX_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
 +REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
@@ -270585,7 +272856,7 @@ index 58e36a4..8eab53b 100644
  
  REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
  REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
-@@ -1030,25 +1567,17 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
+@@ -1030,25 +1673,16 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
  REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
  REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
  REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
@@ -270602,7 +272873,7 @@ index 58e36a4..8eab53b 100644
 -REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
 -REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
  REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
- REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
+-REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
  REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
  REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
  REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
@@ -270611,7 +272882,7 @@ index 58e36a4..8eab53b 100644
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
  REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
-@@ -1098,5 +1627,3 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
+@@ -1098,5 +1732,3 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
  REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
  REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
  REX_EXPORT_STUB(__imp__NetDll_getpeername);
@@ -270695,6 +272966,102 @@ index e0e7dab..492d8d3 100644
  
    return X_STATUS_SUCCESS;
  }
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 8778066..c194330 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -22,6 +22,9 @@
+ #include <rex/types.h>
+ #include <rex/string.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/xlive.h>
++
++#include "apps/xgi_live.h"
+ #include <rex/system/xam/user_profile.h>
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xio.h>
+@@ -78,7 +81,7 @@ u32 XamUserGetSigninState_entry(u32 user_index) {
+ 
+ typedef struct {
+   rex::be<uint64_t> xuid;
+-  rex::be<uint32_t> unk08;  // maybe zero?
++  rex::be<uint32_t> info_flags;  // XUSER_INFO_FLAG_*
+   rex::be<uint32_t> signin_state;
+   rex::be<uint32_t> unk10;  // ?
+   rex::be<uint32_t> unk14;  // ?
+@@ -99,6 +102,9 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+   info->xuid = user_profile->xuid();
+   info->signin_state = user_profile->signin_state();
++  // XUSER_INFO_FLAG_LIVE_ENABLED: an Xbox Live account. Halo 3 only fetches
++  // a player's Bungie user file (and allows matchmaking) for such accounts.
++  info->info_flags = rex::system::xlive::Enabled() ? 0x1 : 0x0;
+   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+   return X_E_SUCCESS;
+ }
+@@ -382,8 +388,10 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+     }
+   }
+ 
+-  // If we deny everything, games should hopefully not try to do stuff.
+-  *out_value = 0;
++  // Offline: deny everything so titles stay off online features. Signed in to
++  // the Live stand-in (live_server): allow everything (multiplayer, voice,
++  // user content...), as for a Gold account.
++  *out_value = xlive::Enabled() ? 1 : 0;
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -713,15 +721,14 @@ u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u3
+ }
+ 
+ u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
+-  *handle_ptr = 0xCAFEDEAD;
++  // A distinct handle per session: XGI messages name the session by the
++  // X_KSESSION object XamSessionRefObjByHandle returns for it.
++  *handle_ptr = xgi_live::CreateSessionHandle();
+   return X_ERROR_SUCCESS;
+ }
+ 
+ u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
+-  assert_true(handle == 0xCAFEDEAD);
+-  // TODO(PermaNull): Implement this properly,
+-  // For the time being returning 0xDEADF00D will prevent crashing.
+-  *obj_ptr = 0xDEADF00D;
++  *obj_ptr = xgi_live::SessionObjectForHandle(REX_KERNEL_STATE(), handle);
+   return X_ERROR_SUCCESS;
+ }
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp b/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
+index 765e042..66b718d 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_crypt.cpp
+@@ -12,6 +12,8 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <mutex>
++#include <random>
+ #include <algorithm>
+ 
+ #include <rex/kernel/xboxkrnl/private.h>
+@@ -327,7 +329,15 @@ u32 XeCryptBnDwLePkcs1Verify_entry(mapped_void hash, mapped_void sig, u32 size)
+ }
+ 
+ void XeCryptRandom_entry(mapped_void buf, u32 buf_size) {
+-  std::memset(buf, 0xFD, buf_size);
++  // Real randomness: titles derive session keys and nonces from it, and
++  // instances playing together must not all produce the same bytes.
++  static std::mutex mutex;
++  static std::mt19937_64 rng{std::random_device{}()};
++  std::lock_guard<std::mutex> lock(mutex);
++  uint8_t* out = buf;
++  for (uint32_t i = 0; i < buf_size; ++i) {
++    out[i] = uint8_t(rng());
++  }
+ }
+ 
+ struct XECRYPT_DES_STATE {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp b/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
 index 5709e6d..94a92e7 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_ob.cpp
@@ -270753,11 +273120,75 @@ index 5709e6d..94a92e7 100644
  REX_EXPORT_STUB(__imp__ObTranslateSymbolicLink);
  REX_EXPORT_STUB(__imp__NtCreateDirectoryObject);
  REX_EXPORT_STUB(__imp__NtCreateSymbolicLinkObject);
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index fc46d86..3daa30b 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -17,6 +17,7 @@ set(REXSYSTEM_SOURCES
+     xnotifylistener.cpp
+     xenumerator.cpp
+     xsocket.cpp
++    xlive.cpp
+     xsymboliclink.cpp
+     xobject.cpp
+     xmodule.cpp
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index 697399c..c280e79 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -40,6 +40,7 @@
+ #include <rex/system/xnotifylistener.h>
+ #include <rex/system/xobject.h>
+ #include <rex/system/xsemaphore.h>
++#include <rex/system/xlive.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtimer.h>
+ 
+@@ -1106,6 +1107,15 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
+     listener->EnqueueNotification(0x00000013, 0);
+     listener->EnqueueNotification(0x00000013, 0);
+   }
++
++  // Signed in to the Live stand-in: tell the first Live listener the
++  // connection is up (Halo 3 treats Live as unreachable until it hears this).
++  static bool has_notified_live_startup = false;
++  if (xlive::Enabled() && !has_notified_live_startup && listener->mask() & 0x00000002) {
++    has_notified_live_startup = true;
++    // XN_LIVE_CONNECTION_CHANGED: XONLINE_S_LOGON_CONNECTION_ESTABLISHED
++    listener->EnqueueNotification(0x02000001, 0x001510F0);
++  }
+ }
+ 
+ void KernelState::UnregisterNotifyListener(XNotifyListener* listener) {
+diff --git a/src/system/xam/app_manager.cpp b/src/system/xam/app_manager.cpp
+index 9b882af..9156f1d 100644
+--- a/src/system/xam/app_manager.cpp
++++ b/src/system/xam/app_manager.cpp
+@@ -39,7 +39,7 @@ X_HRESULT AppManager::DispatchMessageSync(uint32_t app_id, uint32_t message, uin
+ }
+ 
+ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+-                                           uint32_t buffer_length) {
++                                           uint32_t buffer_length, uint32_t* extended_error) {
+   App* app;
+   {
+     auto it = app_lookup_.find(app_id);
+@@ -48,7 +48,9 @@ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, ui
+     }
+     app = it->second;
+   }
+-  return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  uint32_t dummy_extended_error = 0;
++  return app->DispatchMessageAsync(message, buffer_ptr, buffer_length,
++                                   extended_error ? extended_error : &dummy_extended_error);
+ }
+ 
+ }  // namespace xam
 diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
-index a77f5e6..e27cdd1 100644
+index a77f5e6..920605b 100644
 --- a/src/system/xam/user_profile.cpp
 +++ b/src/system/xam/user_profile.cpp
-@@ -13,10 +13,15 @@
+@@ -13,20 +13,44 @@
  
  #include <fmt/format.h>
  
@@ -270765,15 +273196,22 @@ index a77f5e6..e27cdd1 100644
  #include <rex/logging.h>
  #include <rex/system/kernel_state.h>
  #include <rex/system/xam/user_profile.h>
- 
++#include <rex/system/xlive.h>
++
 +REXCVAR_DEFINE_STRING(user_name, "User", "Kernel",
 +                      "Gamertag of the signed-in profile. Give each system link instance its own "
 +                      "name: the XUID is derived from it.");
-+
+ 
  namespace rex {
  namespace system {
  namespace xam {
-@@ -26,7 +31,15 @@ UserProfile::UserProfile() {
+ 
++uint32_t UserProfile::signin_state() const {
++  return xlive::Enabled() ? 2 : 1;
++}
++
+ UserProfile::UserProfile() {
+   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
    // if non-zero, it prevents the user from playing the game.
    // "You do not have permissions to perform this operation."
    xuid_ = 0xB13EBABEBABEBABE;
@@ -270787,9 +273225,341 @@ index a77f5e6..e27cdd1 100644
 +    }
 +    xuid_ = (xuid_ & 0xFFFFFFFF00000000ull) | hash;
 +  }
++  if (xlive::Enabled()) {
++    // Xbox Live accounts have online XUIDs (0x0009...); Live services and
++    // titles key players by them.
++    xuid_ = 0x0009000000000000ull | (xuid_ & 0xFFFFFFFFull);
++    xlive::StartPresence(xuid_, name_);
++  }
  
    // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
    // https://github.com/arkem/py360/blob/master/py360/constants.py
+diff --git a/src/system/xlive.cpp b/src/system/xlive.cpp
+new file mode 100644
+index 0000000..ad61815
+--- /dev/null
++++ b/src/system/xlive.cpp
+@@ -0,0 +1,320 @@
++/**
++ * @file        xlive.cpp
++ * @brief       Client for an Xbox Live stand-in server; see xlive.h.
++ */
++
++#include <rex/system/xlive.h>
++
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <mutex>
++#include <thread>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/platform.h>
++#include <rex/system/xsocket.h>
++
++#include <fmt/format.h>
++#include <inja/third_party/include/nlohmann/json.hpp>
++
++#if !REX_PLATFORM_WIN32
++#include <arpa/inet.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <unistd.h>
++#endif
++
++REXCVAR_DEFINE_STRING(live_server, "", "Network",
++                      "Xbox Live stand-in server (halo3-live-phoenix), e.g. "
++                      "http://127.0.0.1:36080. Empty: offline.");
++
++namespace rex::system::xlive {
++
++namespace {
++
++struct ServerUrl {
++  std::string host;
++  uint16_t port = 80;
++  std::string base_path;  // without trailing '/'
++};
++
++std::optional<ServerUrl> ParseServer() {
++  std::string url = REXCVAR_GET(live_server);
++  if (url.empty()) {
++    return std::nullopt;
++  }
++  constexpr std::string_view kScheme = "http://";
++  if (url.rfind(kScheme, 0) == 0) {
++    url = url.substr(kScheme.size());
++  }
++  ServerUrl out;
++  const size_t slash = url.find('/');
++  std::string authority = url.substr(0, slash);
++  if (slash != std::string::npos) {
++    out.base_path = url.substr(slash);
++    while (!out.base_path.empty() && out.base_path.back() == '/') {
++      out.base_path.pop_back();
++    }
++  }
++  const size_t colon = authority.rfind(':');
++  if (colon != std::string::npos) {
++    out.port = uint16_t(std::stoi(authority.substr(colon + 1)));
++    authority = authority.substr(0, colon);
++  }
++  out.host = authority;
++  return out;
++}
++
++const std::optional<ServerUrl>& Server() {
++  static const std::optional<ServerUrl> server = ParseServer();
++  return server;
++}
++
++#if !REX_PLATFORM_WIN32
++// Reads until the peer closes (the request asks for Connection: close).
++bool ReadAll(int fd, std::string* out, int timeout_ms) {
++  char buf[16384];
++  for (;;) {
++    pollfd p{fd, POLLIN, 0};
++    const int r = poll(&p, 1, timeout_ms);
++    if (r <= 0) {
++      return false;
++    }
++    const ssize_t n = recv(fd, buf, sizeof(buf), 0);
++    if (n < 0) {
++      return false;
++    }
++    if (n == 0) {
++      return true;
++    }
++    out->append(buf, size_t(n));
++  }
++}
++#endif
++
++}  // namespace
++
++bool Enabled() {
++  return Server().has_value();
++}
++
++uint32_t ServerAddress() {
++  static const uint32_t address = [] {
++    if (!Server()) {
++      return 0u;
++    }
++    addrinfo hints{};
++    hints.ai_family = AF_INET;
++    addrinfo* res = nullptr;
++    uint32_t ip = 0;
++    if (getaddrinfo(Server()->host.c_str(), nullptr, &hints, &res) == 0 && res) {
++      ip = ntohl(reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr.s_addr);
++      freeaddrinfo(res);
++    }
++    return ip;
++  }();
++  return address;
++}
++
++uint16_t ServerPort() {
++  return Server() ? Server()->port : 0;
++}
++
++HttpResponse Request(const std::string& method, const std::string& path, const std::string& body,
++                     const std::string& content_type) {
++  HttpResponse response;
++#if REX_PLATFORM_WIN32
++  (void)method, (void)path, (void)body, (void)content_type;
++  REXSYS_WARN("xlive: HTTP client not implemented on Windows");
++  return response;
++#else
++  const auto& server = Server();
++  if (!server || !ServerAddress()) {
++    return response;
++  }
++  const int fd = socket(AF_INET, SOCK_STREAM, 0);
++  if (fd < 0) {
++    return response;
++  }
++  timeval tv{5, 0};
++  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++  sockaddr_in addr{};
++  addr.sin_family = AF_INET;
++  addr.sin_port = htons(server->port);
++  addr.sin_addr.s_addr = htonl(ServerAddress());
++  if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
++    REXSYS_WARN("xlive: cannot reach {}:{}: {}", server->host, server->port, strerror(errno));
++    close(fd);
++    return response;
++  }
++  std::string request = fmt::format(
++      "{} {}{} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nAccept: */*\r\n", method,
++      server->base_path, path, server->host, server->port);
++  if (!body.empty() || method == "POST" || method == "PUT") {
++    request += fmt::format("Content-Type: {}\r\nContent-Length: {}\r\n", content_type, body.size());
++  }
++  request += "\r\n";
++  request += body;
++  size_t sent = 0;
++  while (sent < request.size()) {
++    const ssize_t n = send(fd, request.data() + sent, request.size() - sent, MSG_NOSIGNAL);
++    if (n <= 0) {
++      close(fd);
++      return response;
++    }
++    sent += size_t(n);
++  }
++  std::string raw;
++  const bool complete = ReadAll(fd, &raw, 5000);
++  close(fd);
++  const size_t header_end = raw.find("\r\n\r\n");
++  if (!complete || header_end == std::string::npos || raw.compare(0, 5, "HTTP/") != 0) {
++    REXSYS_WARN("xlive: bad response for {} {}", method, path);
++    return response;
++  }
++  response.status = std::atoi(raw.c_str() + raw.find(' ') + 1);
++  std::string headers = raw.substr(0, header_end);
++  response.body = raw.substr(header_end + 4);
++  // Phoenix answers with Content-Length; decode chunked bodies just in case.
++  std::string lower = headers;
++  for (auto& c : lower) c = char(std::tolower(uint8_t(c)));
++  if (lower.find("transfer-encoding: chunked") != std::string::npos) {
++    std::string decoded;
++    size_t pos = 0;
++    while (pos < response.body.size()) {
++      const size_t eol = response.body.find("\r\n", pos);
++      if (eol == std::string::npos) break;
++      const size_t size = std::stoul(response.body.substr(pos, eol - pos), nullptr, 16);
++      if (!size) break;
++      decoded.append(response.body, eol + 2, size);
++      pos = eol + 2 + size + 2;
++    }
++    response.body = std::move(decoded);
++  }
++  return response;
++#endif
++}
++
++std::string Hex64(uint64_t v) {
++  return fmt::format("{:016X}", v);
++}
++
++std::string Hex32(uint32_t v) {
++  return fmt::format("{:08X}", v);
++}
++
++std::optional<uint64_t> ParseHex64(const std::string& s) {
++  if (s.empty() || s.size() > 16) {
++    return std::nullopt;
++  }
++  uint64_t v = 0;
++  for (char c : s) {
++    v <<= 4;
++    if (c >= '0' && c <= '9') v |= uint64_t(c - '0');
++    else if (c >= 'a' && c <= 'f') v |= uint64_t(c - 'a' + 10);
++    else if (c >= 'A' && c <= 'F') v |= uint64_t(c - 'A' + 10);
++    else return std::nullopt;
++  }
++  return v;
++}
++
++uint64_t MachineId() {
++  // Same derivation as XNetXnAddrToMachineId: 0xFA + the 6-byte MAC.
++  const uint32_t ip = xnet::LocalAddress();
++  return 0xFA00000000000000ull | 0x001DD8000000ull | ((ip & 0xFFFFFF));
++}
++
++std::string MacAddressHex() {
++  const uint32_t ip = xnet::LocalAddress();
++  return fmt::format("001DD8{:02X}{:02X}{:02X}", (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
++}
++
++std::string Base64Encode(const uint8_t* data, size_t size) {
++  static const char* kChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++  std::string out;
++  out.reserve((size + 2) / 3 * 4);
++  for (size_t i = 0; i < size; i += 3) {
++    uint32_t v = uint32_t(data[i]) << 16;
++    if (i + 1 < size) v |= uint32_t(data[i + 1]) << 8;
++    if (i + 2 < size) v |= data[i + 2];
++    out += kChars[(v >> 18) & 63];
++    out += kChars[(v >> 12) & 63];
++    out += i + 1 < size ? kChars[(v >> 6) & 63] : '=';
++    out += i + 2 < size ? kChars[v & 63] : '=';
++  }
++  return out;
++}
++
++std::vector<uint8_t> Base64Decode(const std::string& text) {
++  auto value = [](char c) -> int {
++    if (c >= 'A' && c <= 'Z') return c - 'A';
++    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++    if (c >= '0' && c <= '9') return c - '0' + 52;
++    if (c == '+' || c == '-') return 62;
++    if (c == '/' || c == '_') return 63;
++    return -1;
++  };
++  std::vector<uint8_t> out;
++  uint32_t acc = 0;
++  int bits = 0;
++  for (char c : text) {
++    const int v = value(c);
++    if (v < 0) continue;
++    acc = (acc << 6) | uint32_t(v);
++    bits += 6;
++    if (bits >= 8) {
++      bits -= 8;
++      out.push_back(uint8_t(acc >> bits));
++    }
++  }
++  return out;
++}
++
++void StartPresence(uint64_t xuid, const std::string& gamertag) {
++  static std::once_flag once;
++  if (!Enabled()) {
++    return;
++  }
++  std::call_once(once, [xuid, gamertag] {
++    std::thread([xuid, gamertag] {
++      bool reported = false;
++      // The first registration of this process lets the server drop sessions
++      // this player hosted from an earlier (crashed / restarted) process.
++      bool new_instance = true;
++      for (;;) {
++        nlohmann::json player = {
++            {"xuid", Hex64(xuid)},
++            {"gamertag", gamertag},
++            {"machineId", Hex64(MachineId())},
++            {"macAddress", MacAddressHex()},
++            {"hostAddress", fmt::format("{}.{}.{}.{}", xnet::LocalAddress() >> 24,
++                                        (xnet::LocalAddress() >> 16) & 0xFF,
++                                        (xnet::LocalAddress() >> 8) & 0xFF,
++                                        xnet::LocalAddress() & 0xFF)},
++            {"port", xnet::ToHostPort(1000)},
++            {"newInstance", new_instance},
++        };
++        const auto r = Request("POST", "/xlive/v1/players", player.dump());
++        if (r.ok()) {
++          new_instance = false;
++        }
++        if (r.ok() != reported || !reported) {
++          if (r.ok()) {
++            REXSYS_INFO("xlive: signed in to {} as {} ({})", REXCVAR_GET(live_server), gamertag,
++                        Hex64(xuid));
++          } else {
++            REXSYS_WARN("xlive: player registration failed (HTTP {})", r.status);
++          }
++          reported = r.ok();
++        }
++        std::this_thread::sleep_for(std::chrono::seconds(20));
++      }
++    }).detach();
++  });
++}
++
++}  // namespace rex::system::xlive
 diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
 index d358f39..6371dd3 100644
 --- a/src/system/xobject.cpp
@@ -270909,10 +273679,10 @@ index d358f39..6371dd3 100644
      // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
      XObject* object = nullptr;
 diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
-index 2d13ac8..c330e03 100644
+index 2d13ac8..fc8aa4f 100644
 --- a/src/system/xsocket.cpp
 +++ b/src/system/xsocket.cpp
-@@ -9,7 +9,16 @@
+@@ -9,11 +9,22 @@
   * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
@@ -270920,6 +273690,7 @@ index 2d13ac8..c330e03 100644
  #include <cstring>
 +#include <mutex>
 +#include <unordered_map>
++#include <unordered_set>
 +
 +#include <rex/cvar.h>
 +#include <rex/logging.h>
@@ -270929,7 +273700,12 @@ index 2d13ac8..c330e03 100644
  
  #include <rex/kernel/xam/module.h>
  #include <rex/platform.h>
-@@ -28,11 +37,224 @@
+ #include <rex/system/kernel_state.h>
++#include <rex/system/xlive.h>
+ #include <rex/system/xsocket.h>
+ // #include <rex/system/xnet.h>
+ 
+@@ -28,11 +39,236 @@
  #include <arpa/inet.h>
  #include <netinet/in.h>
  #include <netinet/ip.h>
@@ -271047,6 +273823,7 @@ index 2d13ac8..c330e03 100644
 +std::unordered_map<uint32_t, uint32_t> secure_to_ip;
 +std::unordered_map<uint32_t, uint32_t> ip_to_secure;
 +uint32_t next_secure = 1;
++std::unordered_set<uint32_t> title_server_secure;
 +}  // namespace
 +
 +uint32_t SecureFromIp(uint32_t ip, bool create) {
@@ -271081,6 +273858,17 @@ index 2d13ac8..c330e03 100644
 +    ip_to_secure.erase(it->second);
 +    secure_to_ip.erase(it);
 +  }
++  title_server_secure.erase(secure);
++}
++
++void MarkTitleServer(uint32_t secure) {
++  std::lock_guard<std::mutex> lock(secure_mutex);
++  title_server_secure.insert(secure);
++}
++
++bool IsTitleServer(uint32_t secure) {
++  std::lock_guard<std::mutex> lock(secure_mutex);
++  return title_server_secure.count(secure) != 0;
 +}
 +
 +bool LoopbackMode() {
@@ -271154,7 +273942,7 @@ index 2d13ac8..c330e03 100644
  XSocket::XSocket(KernelState* kernel_state) : XObject(kernel_state, kObjectType) {}
  
  XSocket::XSocket(KernelState* kernel_state, uint64_t native_handle)
-@@ -48,15 +270,27 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
+@@ -48,15 +284,27 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
    proto_ = proto;
  
    if (proto == Protocol::X_IPPROTO_VDP) {
@@ -271183,7 +273971,7 @@ index 2d13ac8..c330e03 100644
    return X_STATUS_SUCCESS;
  }
  
-@@ -76,24 +310,83 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+@@ -76,24 +324,83 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
      return X_STATUS_SUCCESS;
    }
  
@@ -271274,7 +274062,7 @@ index 2d13ac8..c330e03 100644
      return X_STATUS_UNSUCCESSFUL;
    }
  
-@@ -101,7 +394,29 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
+@@ -101,7 +408,33 @@ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
  }
  
  X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
@@ -271292,20 +274080,24 @@ index 2d13ac8..c330e03 100644
 +  addr.sin_port = htons(xnet::ToHostPort(uint16_t(data[0] << 8 | data[1])));
 +  uint32_t dest = uint32_t(data[2]) << 24 | uint32_t(data[3]) << 16 | uint32_t(data[4]) << 8 |
 +                  data[5];
++  const bool title_server = xnet::IsSecure(dest) && xnet::IsTitleServer(dest);
 +  if (xnet::IsSecure(dest) && !xnet::IpFromSecure(dest, &dest)) {
 +    return X_STATUS_UNSUCCESSFUL;
++  }
++  if (title_server && xlive::Enabled()) {
++    addr.sin_port = htons(xlive::ServerPort());
 +  }
 +  addr.sin_addr.s_addr = htonl(dest);
 +  int ret = connect(native_handle_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
 +  if (REXCVAR_GET(net_log)) {
-+    REXSYS_INFO("net: fd {} connect {} -> {}", int64_t(native_handle_),
++    REXSYS_INFO("net: fd {} connect {}{} -> {}", int64_t(native_handle_),
 +                xnet::FormatAddress(ntohl(addr.sin_addr.s_addr), ntohs(addr.sin_port)),
-+                ret < 0 ? strerror(errno) : "ok");
++                title_server ? " (title server)" : "", ret < 0 ? strerror(errno) : "ok");
 +  }
    if (ret < 0) {
      return X_STATUS_UNSUCCESSFUL;
    }
-@@ -110,7 +425,20 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
+@@ -110,7 +443,20 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
  }
  
  X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
@@ -271327,7 +274119,7 @@ index 2d13ac8..c330e03 100644
    if (ret < 0) {
      return X_STATUS_UNSUCCESSFUL;
    }
-@@ -121,6 +449,18 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+@@ -121,6 +467,18 @@ X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
    return X_STATUS_SUCCESS;
  }
  
@@ -271346,7 +274138,7 @@ index 2d13ac8..c330e03 100644
  X_STATUS XSocket::Listen(int backlog) {
    int ret = listen(native_handle_, backlog);
    if (ret < 0) {
-@@ -163,73 +503,114 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
+@@ -163,73 +521,114 @@ int XSocket::Recv(uint8_t* buf, uint32_t buf_len, uint32_t flags) {
  
  int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
                        uint32_t* from_len) {
