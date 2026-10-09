@@ -10360,10 +10360,24 @@ index 84be3e4..4007028 100644
   private:
    std::vector<std::unique_ptr<App>> apps_;
 diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
-index ec37017..c5eda3f 100644
+index ec37017..085b3cb 100644
 --- a/include/rex/system/xam/user_profile.h
 +++ b/include/rex/system/xam/user_profile.h
-@@ -218,7 +218,8 @@ class UserProfile {
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <filesystem>
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
+@@ -214,11 +215,13 @@ class UserProfile {
+     }
+   };
+ 
+-  UserProfile();
++  // `data_root`: the user data folder (holds the Live account file).
++  explicit UserProfile(const std::filesystem::path& data_root = {});
  
    uint64_t xuid() const { return xuid_; }
    std::string name() const { return name_; }
@@ -10375,10 +10389,10 @@ index ec37017..c5eda3f 100644
    void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
 diff --git a/include/rex/system/xlive.h b/include/rex/system/xlive.h
 new file mode 100644
-index 0000000..bf08916
+index 0000000..1de316a
 --- /dev/null
 +++ b/include/rex/system/xlive.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,71 @@
 +/**
 + * @file        xlive.h
 + * @brief       Client for an Xbox Live stand-in server (halo3-live-phoenix).
@@ -10393,6 +10407,7 @@ index 0000000..bf08916
 +#pragma once
 +
 +#include <cstdint>
++#include <filesystem>
 +#include <optional>
 +#include <string>
 +#include <vector>
@@ -10417,6 +10432,21 @@ index 0000000..bf08916
 +uint32_t ServerAddress();
 +// The server's TCP port (from live_server; 80 when not given).
 +uint16_t ServerPort();
++
++// A Live account issued by the server: a permanent XUID plus the secret
++// token that proves this profile owns it.
++struct Account {
++  uint64_t xuid = 0;
++  std::string gamertag;
++  std::string token;
++};
++
++// Signs the profile in. With a saved account (`account_file`) the server
++// confirms it (and renames it when `gamertag` changed); without one the
++// server creates an account and it is saved. Every later Request() carries
++// the token. Returns nullopt when offline and nothing is saved.
++std::optional<Account> SignIn(const std::string& gamertag,
++                              const std::filesystem::path& account_file);
 +
 +// Starts the player registration heartbeat (idempotent).
 +void StartPresence(uint64_t xuid, const std::string& gamertag);
@@ -269850,10 +269880,10 @@ index 2b222da..9697b85 100644
            proc_index, user_index, num_results, num_weighted_properties, num_weighted_contexts,
 diff --git a/src/kernel/xam/apps/xgi_live.cpp b/src/kernel/xam/apps/xgi_live.cpp
 new file mode 100644
-index 0000000..fecdba9
+index 0000000..794c8aa
 --- /dev/null
 +++ b/src/kernel/xam/apps/xgi_live.cpp
-@@ -0,0 +1,949 @@
+@@ -0,0 +1,967 @@
 +/**
 + * @file        xgi_live.cpp
 + * @brief       XGI sessions backed by the Xbox Live stand-in server.
@@ -270769,10 +270799,28 @@ index 0000000..fecdba9
 +        if (!s) return std::nullopt;
 +        id = s->id;
 +      }
-+      Call("POST", SessionPath(ks, id) + "/stats",
-+           {{"xuid", xlive::Hex64(load_and_swap<uint64_t>(b + 4))},
-+            {"flush", message == 0x000B0026},
-+            {"views", u32(12)}});
++      // XGI_STATS_WRITE { obj_ptr; pad; xuid (+8); num_views (+16); views_ptr (+20) },
++      // views: XSESSION_VIEW_PROPERTIES { view_id; properties_count; properties_ptr }.
++      json views = json::array();
++      if (message == 0x000B0025) {
++        const uint32_t num_views = std::min<uint32_t>(u32(16), 64), views_ptr = u32(20);
++        for (uint32_t i = 0; views_ptr && i < num_views; ++i) {
++          const uint8_t* v = mem->TranslateVirtual<uint8_t*>(views_ptr + i * 12);
++          const uint32_t count = std::min<uint32_t>(load_and_swap<uint32_t>(v + 4), 256);
++          const uint32_t props_ptr = load_and_swap<uint32_t>(v + 8);
++          json properties = json::array();
++          for (uint32_t k = 0; props_ptr && k < count; ++k) {
++            properties.push_back(PropertyJson(ReadGuestProperty(
++                ks, mem->TranslateVirtual<uint8_t*>(props_ptr + k * uint32_t(kPropertySize)))));
++          }
++          views.push_back({{"viewId", load_and_swap<uint32_t>(v + 0)}, {"properties", properties}});
++        }
++      }
++      json body = {{"flush", message == 0x000B0026}, {"views", views}};
++      if (message == 0x000B0025) {
++        body["xuid"] = xlive::Hex64(load_and_swap<uint64_t>(b + 8));
++      }
++      Call("POST", SessionPath(ks, id) + "/stats", body);
 +      return X_E_SUCCESS;
 +    }
 +
@@ -273133,7 +273181,7 @@ index fc46d86..3daa30b 100644
      xobject.cpp
      xmodule.cpp
 diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
-index 697399c..c280e79 100644
+index 697399c..e653e14 100644
 --- a/src/system/kernel_state.cpp
 +++ b/src/system/kernel_state.cpp
 @@ -40,6 +40,7 @@
@@ -273144,6 +273192,15 @@ index 697399c..c280e79 100644
  #include <rex/system/xthread.h>
  #include <rex/system/xtimer.h>
  
+@@ -65,7 +66,7 @@ KernelState::KernelState(Runtime* emulator)
+   file_system_ = emulator->file_system();
+ 
+   app_manager_ = std::make_unique<xam::AppManager>();
+-  user_profile_ = std::make_unique<xam::UserProfile>();
++  user_profile_ = std::make_unique<xam::UserProfile>(emulator_->user_data_root());
+   user_profile_->set_kernel_state(this);
+ 
+   auto user_data_root = emulator_->user_data_root();
 @@ -1106,6 +1107,15 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
      listener->EnqueueNotification(0x00000013, 0);
      listener->EnqueueNotification(0x00000013, 0);
@@ -273185,10 +273242,10 @@ index 9b882af..9156f1d 100644
  
  }  // namespace xam
 diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
-index a77f5e6..920605b 100644
+index a77f5e6..28523d0 100644
 --- a/src/system/xam/user_profile.cpp
 +++ b/src/system/xam/user_profile.cpp
-@@ -13,20 +13,44 @@
+@@ -13,20 +13,50 @@
  
  #include <fmt/format.h>
  
@@ -273206,11 +273263,12 @@ index a77f5e6..920605b 100644
  namespace system {
  namespace xam {
  
+-UserProfile::UserProfile() {
 +uint32_t UserProfile::signin_state() const {
 +  return xlive::Enabled() ? 2 : 1;
 +}
 +
- UserProfile::UserProfile() {
++UserProfile::UserProfile(const std::filesystem::path& data_root) {
    // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
    // if non-zero, it prevents the user from playing the game.
    // "You do not have permissions to perform this operation."
@@ -273227,8 +273285,14 @@ index a77f5e6..920605b 100644
 +  }
 +  if (xlive::Enabled()) {
 +    // Xbox Live accounts have online XUIDs (0x0009...); Live services and
-+    // titles key players by them.
++    // titles key players by them. The server issues the XUID (kept with its
++    // token in the user data folder); offline with no saved account, fall
++    // back to one derived from the gamertag.
 +    xuid_ = 0x0009000000000000ull | (xuid_ & 0xFFFFFFFFull);
++    if (auto account = xlive::SignIn(name_, data_root / "live_account.json")) {
++      xuid_ = account->xuid;
++      name_ = account->gamertag;
++    }
 +    xlive::StartPresence(xuid_, name_);
 +  }
  
@@ -273236,10 +273300,10 @@ index a77f5e6..920605b 100644
    // https://github.com/arkem/py360/blob/master/py360/constants.py
 diff --git a/src/system/xlive.cpp b/src/system/xlive.cpp
 new file mode 100644
-index 0000000..ad61815
+index 0000000..44f1935
 --- /dev/null
 +++ b/src/system/xlive.cpp
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,388 @@
 +/**
 + * @file        xlive.cpp
 + * @brief       Client for an Xbox Live stand-in server; see xlive.h.
@@ -273250,6 +273314,7 @@ index 0000000..ad61815
 +#include <atomic>
 +#include <chrono>
 +#include <cstring>
++#include <fstream>
 +#include <mutex>
 +#include <thread>
 +
@@ -273309,6 +273374,14 @@ index 0000000..ad61815
 +  }
 +  out.host = authority;
 +  return out;
++}
++
++std::mutex token_mutex;
++std::string auth_token;  // the signed-in account's token, sent on every request
++
++std::string Token() {
++  std::lock_guard<std::mutex> lock(token_mutex);
++  return auth_token;
 +}
 +
 +const std::optional<ServerUrl>& Server() {
@@ -273396,6 +273469,9 @@ index 0000000..ad61815
 +  std::string request = fmt::format(
 +      "{} {}{} HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\nAccept: */*\r\n", method,
 +      server->base_path, path, server->host, server->port);
++  if (const std::string token = Token(); !token.empty()) {
++    request += fmt::format("Authorization: Bearer {}\r\n", token);
++  }
 +  if (!body.empty() || method == "POST" || method == "PUT") {
 +    request += fmt::format("Content-Type: {}\r\nContent-Length: {}\r\n", content_type, body.size());
 +  }
@@ -273514,6 +273590,62 @@ index 0000000..ad61815
 +    }
 +  }
 +  return out;
++}
++
++std::optional<Account> SignIn(const std::string& gamertag,
++                              const std::filesystem::path& account_file) {
++  if (!Enabled()) {
++    return std::nullopt;
++  }
++  std::optional<Account> saved;
++  {
++    std::ifstream in(account_file);
++    nlohmann::json j = nlohmann::json::parse(in, nullptr, false);
++    if (!j.is_discarded() && j.is_object()) {
++      const auto xuid = ParseHex64(j.value("xuid", ""));
++      if (xuid && !j.value("token", "").empty()) {
++        saved = Account{*xuid, j.value("gamertag", ""), j.value("token", "")};
++      }
++    }
++  }
++  if (saved) {
++    std::lock_guard<std::mutex> lock(token_mutex);
++    auth_token = saved->token;
++  }
++  const auto r = Request("POST", "/xlive/v1/accounts", nlohmann::json{{"gamertag", gamertag}}.dump());
++  nlohmann::json body = nlohmann::json::parse(r.body, nullptr, false);
++  if (!r.ok() || body.is_discarded() || !ParseHex64(body.value("xuid", ""))) {
++    if (saved) {
++      REXSYS_WARN("xlive: account check failed (HTTP {}); using saved account {} ({})", r.status,
++                  saved->gamertag, Hex64(saved->xuid));
++    } else {
++      REXSYS_WARN("xlive: cannot create an account (HTTP {}): {}", r.status, r.body);
++    }
++    return saved;
++  }
++  Account account{*ParseHex64(body.value("xuid", "")), body.value("gamertag", gamertag),
++                  body.value("token", saved ? saved->token : std::string())};
++  {
++    std::lock_guard<std::mutex> lock(token_mutex);
++    auth_token = account.token;
++  }
++  if (!saved || saved->xuid != account.xuid || saved->gamertag != account.gamertag ||
++      saved->token != account.token) {
++    std::error_code ec;
++    std::filesystem::create_directories(account_file.parent_path(), ec);
++    std::ofstream out(account_file, std::ios::trunc);
++    out << nlohmann::json{{"xuid", Hex64(account.xuid)},
++                          {"gamertag", account.gamertag},
++                          {"token", account.token}}
++               .dump(2)
++        << "\n";
++    if (!out) {
++      REXSYS_WARN("xlive: cannot save the account to {}", account_file.string());
++    }
++  }
++  REXSYS_INFO("xlive: account {} ({}){}", account.gamertag, Hex64(account.xuid),
++              saved ? "" : ", new");
++  return account;
 +}
 +
 +void StartPresence(uint64_t xuid, const std::string& gamertag) {
