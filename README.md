@@ -65,8 +65,10 @@ play-halo3.cmd -Name YourName              system link on the LAN
 play-halo3.cmd -Name YourName -Zt          system link over ZeroTier
 ```
 
-The other options (`-Instance N`, `-Ip`, `-Live`, `-Fullscreen`, `-Scale N`)
-are listed at the top of `play-halo3.ps1`.
+Add `-Mnk` to play with mouse and keyboard (WASD, mouse aim, left click to
+fire; `-Sensitivity N` for mouse speed). The full key layout and the other
+options (`-Instance N`, `-Ip`, `-Live`, `-Fullscreen`, `-Scale N`) are listed
+at the top of `play-halo3.ps1`.
 
 ## ZeroTier notes
 

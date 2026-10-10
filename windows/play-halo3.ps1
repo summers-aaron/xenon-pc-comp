@@ -2,7 +2,7 @@
 Boot the Windows build of the Halo 3 port. Lives next to halo3.exe in the
 folder setup-halo3-windows.sh stages (game data in .\game).
 
-  .\play-halo3.cmd [options] [-- extra runtime flags]
+  .\play-halo3.cmd [options] [extra runtime flags, e.g. --keybind_y=Q]
 
   -Name NAME         gamertag; every player needs a different one
   -Live              sign in to the Xbox Live stand-in (slop-box-live); enables matchmaking
@@ -14,6 +14,15 @@ folder setup-halo3-windows.sh stages (game data in .\game).
   -Fullscreen        fullscreen instead of a 1280x800 window
   -Scale N           render at N x N internal resolution
   -Fps               print the guest frame rate every 5 s
+  -Mnk               play with mouse and keyboard instead of a controller:
+                       WASD move        mouse aim         left click fire
+                       right click zoom G grenade         T switch grenades
+                       R reload/action  F melee           E equipment
+                       1 switch weapon  C crouch          Space jump
+                       Tab scoreboard   Enter pause       Shift+arrows D-pad
+                     Override single keys with extra flags such as --keybind_y=Q (keys:
+                     letters, digits, Space, Tab, Return, LMB, RMB, MMB, Numpad0...)
+  -Sensitivity N     mouse speed with -Mnk (0.01..10, default 1)
 Anything else is passed to the game unchanged.
 #>
 param(
@@ -26,6 +35,8 @@ param(
   [switch]$Fullscreen,
   [int]$Scale = 0,
   [switch]$Fps,
+  [switch]$Mnk,
+  [double]$Sensitivity = 0,
   [Parameter(ValueFromRemainingArguments = $true)][string[]]$Extra
 )
 $ErrorActionPreference = "Stop"
@@ -61,6 +72,26 @@ if ($Instance -ne 0) {
   throw "halo3 is already running (use -Instance N for several on one PC)"
 }
 if ($Ip) { $gameArgs += "--net_ip=$Ip" }
+
+if ($Mnk) {
+  $mnkArgs = [ordered]@{
+    mnk_mode = "true"; mnk_mouse = "true"
+    keybind_right_trigger = "LMB"; keybind_rstick_press = "RMB"
+    keybind_left_trigger = "G"; keybind_left_shoulder = "T"
+    keybind_right_shoulder = "R"; keybind_a = "Space"; keybind_b = "F"
+    keybind_x = "E"; keybind_y = "1"; keybind_lstick_press = "C"
+    keybind_back = "Tab"; keybind_start = "Return"
+  }
+  if ($Sensitivity -gt 0) {
+    $mnkArgs.mnk_sensitivity = $Sensitivity.ToString([cultureinfo]::InvariantCulture)
+  }
+  # A flag given more than once is rejected by the runtime, so extra flags
+  # replace the layout's value for the same name instead of repeating it.
+  $given = @($Extra | ForEach-Object { if ($_ -match '^--([^=]+)=') { $Matches[1] } })
+  foreach ($key in $mnkArgs.Keys) {
+    if ($given -notcontains $key) { $gameArgs += "--$key=$($mnkArgs[$key])" }
+  }
+}
 if ($Extra) { $gameArgs += $Extra | Where-Object { $_ -ne "--" } }
 
 Set-Location $root
