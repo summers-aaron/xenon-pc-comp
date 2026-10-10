@@ -8,7 +8,7 @@ folder setup-halo3-windows.sh stages (game data in .\game).
   -Live              sign in to the Xbox Live stand-in (slop-box-live); enables matchmaking
   -LiveServer URL    its address (default http://127.0.0.1:36080)
   -Instance N        several instances on one PC: instance N (1..16) uses 127.0.0.<N+1>,
-                     gamertag PlayerN and its own saves/caches (instances\N)
+                     gamertag PlayerN (or -Name) and its own saves/caches (instances\N)
   -Zt                system link over ZeroTier: advertise this PC's ZeroTier IPv4 address
   -Ip ADDR           system link using this IPv4 address instead of the default adapter
   -Fullscreen        fullscreen instead of a 1280x800 window
@@ -85,14 +85,19 @@ if ($Mnk) {
   if ($Sensitivity -gt 0) {
     $mnkArgs.mnk_sensitivity = $Sensitivity.ToString([cultureinfo]::InvariantCulture)
   }
-  # A flag given more than once is rejected by the runtime, so extra flags
-  # replace the layout's value for the same name instead of repeating it.
-  $given = @($Extra | ForEach-Object { if ($_ -match '^--([^=]+)=') { $Matches[1] } })
-  foreach ($key in $mnkArgs.Keys) {
-    if ($given -notcontains $key) { $gameArgs += "--$key=$($mnkArgs[$key])" }
-  }
+  foreach ($key in $mnkArgs.Keys) { $gameArgs += "--$key=$($mnkArgs[$key])" }
 }
 if ($Extra) { $gameArgs += $Extra | Where-Object { $_ -ne "--" } }
+
+# The runtime rejects a flag given more than once, and that parse error also
+# drops other flags (--gpu_plugin among them, leaving a black screen). Pass only
+# the last value of each flag, so -Name with -Instance or an extra flag that
+# repeats one set above (such as a single --keybind_*) just overrides it.
+$last = @{}
+for ($i = 0; $i -lt $gameArgs.Count; ++$i) { $last[($gameArgs[$i] -split '=', 2)[0]] = $i }
+$gameArgs = @(for ($i = 0; $i -lt $gameArgs.Count; ++$i) {
+    if ($last[($gameArgs[$i] -split '=', 2)[0]] -eq $i) { $gameArgs[$i] }
+  })
 
 Set-Location $root
 & $exe @gameArgs

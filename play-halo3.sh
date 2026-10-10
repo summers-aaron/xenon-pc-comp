@@ -123,5 +123,13 @@ for gpu_plugin in librexgpu-xenos.so librexgpu-xgpu.so; do
   [ -e "$SDK_LIB/$gpu_plugin" ] || continue
   [ -e "$gpu_plugin" ] || ln -sfn "$SDK_LIB/$gpu_plugin" "$gpu_plugin"
 done
-exec env "${envs[@]}" LD_LIBRARY_PATH="$BUILD:$H3_LIB:$SDK_LIB" ./halo3 \
-  --game_data_root="$GAME" --gpu_plugin=$plugin "${window[@]}" "${extra[@]}"
+# The runtime rejects a flag given more than once, and that parse error also
+# drops other flags (--gpu_plugin among them, leaving a black screen). Pass only
+# the last value of each flag, so --name with --instance or a repeated extra
+# flag just overrides the earlier one.
+args=(--game_data_root="$GAME" --gpu_plugin=$plugin "${window[@]}" "${extra[@]}")
+declare -A last
+for i in "${!args[@]}"; do last[${args[i]%%=*}]=$i; done
+final=()
+for i in "${!args[@]}"; do [ "${last[${args[i]%%=*}]}" = "$i" ] && final+=("${args[i]}"); done
+exec env "${envs[@]}" LD_LIBRARY_PATH="$BUILD:$H3_LIB:$SDK_LIB" ./halo3 "${final[@]}"
