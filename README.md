@@ -54,8 +54,8 @@ renderer), `--fps`, `--scale N`, `--help`.
 ./setup-halo3-windows.sh "/path/to/Halo 3.iso"
 ```
 
-It builds x86_64 by default (Windows on ARM runs it through its x64
-emulation); `WIN_ARCH=aarch64` builds for Windows on ARM natively. The
+It builds natively for Windows on ARM (aarch64) by default; `WIN_ARCH=x86_64`
+builds for x64 Windows (which Windows on ARM can also run through emulation). The
 renderer is Direct3D 12. Building the cross-compile container accepts
 Microsoft's license for the MSVC CRT and Windows SDK (fetched with xwin).
 On Windows, from the install folder:

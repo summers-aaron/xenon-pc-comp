@@ -14,7 +14,7 @@
 #
 # AUTOPORT_TARGET=windows cross-compiles step 6 for Windows instead (container
 # xenon-build-win-<arch>, autoport/windows/clang-msvc.cmake) against the Windows SDK
-# install in AUTOPORT_WIN_SDK. WIN_ARCH is x86_64 (default) or aarch64.
+# install in AUTOPORT_WIN_SDK. WIN_ARCH is aarch64 (default) or x86_64.
 # AUTOPORT_REXGLUE overrides the rexglue binary (autoport/rexglue-container.sh
 # runs it in the build container when the host glibc is too old).
 set -euo pipefail
@@ -92,7 +92,7 @@ python3 "$AP/gen_xdll_imports.py" "$M" --log codegen_auto.log
 python3 "$AP/patch_spin_hints.py" "$M"
 
 if [ "$TARGET" = windows ]; then
-  WIN_ARCH=${WIN_ARCH:-x86_64}
+  WIN_ARCH=${WIN_ARCH:-aarch64}
   WIN_SDK=${AUTOPORT_WIN_SDK:-$ROOT/tools/rexglue-win-$WIN_ARCH}
   WIN_BUILD="podman run --rm --userns=keep-id -v $ROOT:$ROOT:Z -w $PORT xenon-build-win-$WIN_ARCH"
   B=$PORT/out/build/win-$WIN_ARCH-release

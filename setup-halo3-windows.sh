@@ -6,8 +6,8 @@
 #
 # WINDOWS_DIR is where halo3.exe, its DLLs, the launcher and the game data go,
 # as a WSL path (default: %USERPROFILE%\Halo3). WIN_ARCH is the CPU to build
-# for: x86_64 (default; also runs on Windows on ARM through its x64 emulation)
-# or aarch64 (native Windows on ARM). The renderer is Direct3D 12 (Vulkan is
+# for: aarch64 (default; native Windows on ARM) or x86_64 (x64 Windows, and
+# also Windows on ARM through its x64 emulation). The renderer is Direct3D 12 (Vulkan is
 # built in too, but the runtime picks Direct3D 12).
 #
 # Steps (all re-run safe):
@@ -27,7 +27,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 ISO=${1:-}
-WIN_ARCH=${WIN_ARCH:-x86_64}
+WIN_ARCH=${WIN_ARCH:-aarch64}
 SDK=$ROOT/tools/rexglue-resync
 WIN_SDK=$ROOT/tools/rexglue-win-$WIN_ARCH
 WIN_IMAGE=xenon-build-win-$WIN_ARCH
