@@ -44,6 +44,30 @@ Useful launcher flags: `--instance N` (several instances on one PC),
 `--ip ADDR` (pick the system-link interface), `--native` (experimental native
 renderer), `--fps`, `--scale N`, `--help`.
 
+## Windows
+
+`setup-halo3-windows.sh` cross-compiles the same port for Windows in podman
+(from WSL or Linux) and installs it into a Windows folder (default
+`%USERPROFILE%\Halo3`):
+
+```bash
+./setup-halo3-windows.sh "/path/to/Halo 3.iso"
+```
+
+It builds x86_64 by default (Windows on ARM runs it through its x64
+emulation); `WIN_ARCH=aarch64` builds for Windows on ARM natively. The
+renderer is Direct3D 12. Building the cross-compile container accepts
+Microsoft's license for the MSVC CRT and Windows SDK (fetched with xwin).
+On Windows, from the install folder:
+
+```
+play-halo3.cmd -Name YourName              system link on the LAN
+play-halo3.cmd -Name YourName -Zt          system link over ZeroTier
+```
+
+The other options (`-Instance N`, `-Ip`, `-Live`, `-Fullscreen`, `-Scale N`)
+are listed at the top of `play-halo3.ps1`.
+
 ## ZeroTier notes
 
 Both machines only need to join the same ZeroTier network — no port
@@ -61,9 +85,12 @@ each other.
 | `autoport/` | ISO → native pipeline (codegen fixups, runtime hooks, build) |
 | `autoport/sdk-patches/halo3-system-link.diff` | Everything changed in ReXGlue: Canary GPU re-sync, Halo 3 fixes, system link |
 | `play-halo3.sh` | Launcher |
+| `setup-halo3-windows.sh`, `windows/` | Windows cross-build and its launcher |
+| `autoport/windows/` | Windows cross-compile toolchain (clang + xwin) and helpers |
 | `tools/zt-probe.py` | Find running Halo 3s on the ZeroTier/LAN link |
 | `xenon-gpu/` | Experimental native renderer (`--native`); optional |
 | `docker/Containerfile` | Build container (clang, GTK3, shader tools) |
+| `docker/Containerfile.windows` | Windows cross-compile container |
 
 Status: Halo 3 boots to the menu, campaign loads (Arrival → Sierra 117 and
 beyond), and system link multiplayer works between instances/machines. The

@@ -11,6 +11,12 @@
 #   5. cross-DLL import thunks                             (gen_xdll_imports.py)
 #   6. build in Fedora container (clang + gtk3)
 #   7. headless runtime loop: missed indirect targets      (runtime_loop.py)
+#
+# AUTOPORT_TARGET=windows cross-compiles step 6 for Windows instead (container
+# xenon-build-win-<arch>, autoport/windows/clang-msvc.cmake) against the Windows SDK
+# install in AUTOPORT_WIN_SDK. WIN_ARCH is x86_64 (default) or aarch64.
+# AUTOPORT_REXGLUE overrides the rexglue binary (autoport/rexglue-container.sh
+# runs it in the build container when the host glibc is too old).
 set -euo pipefail
 
 ISO=$(realpath "$1"); WORK=$(realpath -m "$2"); NAME=$3
@@ -19,7 +25,9 @@ AP=$ROOT/autoport
 # Patched ReXGlue v0.10.0 built from ref/rexglue-sdk (fixes rexglue-sdk#456 and friends).
 SDK=${AUTOPORT_SDK:-$ROOT/tools/rexglue-src}
 SDK_LIB=$SDK/lib64
-REXGLUE=$SDK/bin/rexglue
+REXGLUE=${AUTOPORT_REXGLUE:-$SDK/bin/rexglue}
+TARGET=${AUTOPORT_TARGET:-linux}
+JOBS=${AUTOPORT_JOBS:-$(nproc)}
 XISO=$ROOT/tools/extract-xiso/build/extract-xiso
 PORT=$WORK/port
 BUILD="podman run --rm --userns=keep-id -v $ROOT:$ROOT:Z -w $PORT xenon-build"
@@ -57,6 +65,19 @@ EOF
     "$PORT/src/${NAME}_app.h"
 fi
 
+# Cross builds can't run the target's rexglue for the build-time codegen step;
+# REXGLUE_HOST_TOOL names a host one. Added separately so older ports get it too.
+if ! grep -q REXGLUE_HOST_TOOL "$PORT/CMakeLists.txt"; then
+  cat >> "$PORT/CMakeLists.txt" <<'EOF2'
+
+# autoport: cross builds run codegen with a host rexglue (-DREXGLUE_HOST_TOOL=...)
+if(REXGLUE_HOST_TOOL)
+  set_target_properties(rex::rexglue PROPERTIES
+    IMPORTED_LOCATION "${REXGLUE_HOST_TOOL}" IMPORTED_LOCATION_RELEASE "${REXGLUE_HOST_TOOL}")
+endif()
+EOF2
+fi
+
 cd "$PORT"
 M=${NAME}_manifest.toml
 python3 "$AP/fix_unresolved.py" "$M" --rexglue "$REXGLUE"
@@ -69,6 +90,21 @@ if python3 "$AP/fix_switch_tables.py" "$M" | grep -q " -> "; then
 fi
 python3 "$AP/gen_xdll_imports.py" "$M" --log codegen_auto.log
 python3 "$AP/patch_spin_hints.py" "$M"
+
+if [ "$TARGET" = windows ]; then
+  WIN_ARCH=${WIN_ARCH:-x86_64}
+  WIN_SDK=${AUTOPORT_WIN_SDK:-$ROOT/tools/rexglue-win-$WIN_ARCH}
+  WIN_BUILD="podman run --rm --userns=keep-id -v $ROOT:$ROOT:Z -w $PORT xenon-build-win-$WIN_ARCH"
+  B=$PORT/out/build/win-$WIN_ARCH-release
+  [ -f "$B/build.ninja" ] || $WIN_BUILD cmake -S . -B "$B" -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE="$AP/windows/clang-msvc.cmake" -DWIN_ARCH="$WIN_ARCH" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$WIN_SDK" -DREXGLUE_HOST_TOOL="$SDK/bin/rexglue"
+  $WIN_BUILD cmake --build "$B" -j"$JOBS"
+  # The SDK's DLLs (runtime, GPU plugins, SDL) sit next to the executable.
+  cp -f "$WIN_SDK"/bin/*.dll "$B/"
+  echo "Built: $B/$NAME.exe"
+  exit 0
+fi
 
 [ -f out/build/linux-release/build.ninja ] || $BUILD cmake -S . -B out/build/linux-release -G Ninja \
   -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$SDK"

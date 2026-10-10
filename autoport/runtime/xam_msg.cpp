@@ -11,16 +11,39 @@
 
 #include <rex/hook.h>
 
-#include <dlfcn.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 namespace {
 using ImportFn = void (*)(PPCContext&, uint8_t*);
 constexpr uint32_t kXamAppId = 0xFE;
 constexpr uint32_t kMsgQueryVolumeDeviceType = 0x00020021;
 constexpr uint32_t kInvalidArg = 0x80070057;  // X_E_INVALIDARG
+
+// The SDK's own export, which this hook overrides for the game.
+ImportFn SdkImport(const char* name) {
+#if defined(_WIN32)
+  // rexruntime.dll exports every symbol (WINDOWS_EXPORT_ALL_SYMBOLS).
+  HMODULE sdk = GetModuleHandleA("rexruntime.dll");
+  return sdk ? reinterpret_cast<ImportFn>(reinterpret_cast<void*>(GetProcAddress(sdk, name)))
+             : nullptr;
+#else
+  return reinterpret_cast<ImportFn>(dlsym(RTLD_NEXT, name));
+#endif
+}
 }  // namespace
 
 // u32 XMsgStartIORequest(u32 app, u32 message, XOVERLAPPED* overlapped, void* buffer, u32 length)
@@ -35,6 +58,6 @@ REX_HOOK_RAW(__imp__XMsgStartIORequest) {
     ctx.r3.u64 = kInvalidArg;
     return;
   }
-  static auto real = reinterpret_cast<ImportFn>(dlsym(RTLD_NEXT, "__imp__XMsgStartIORequest"));
+  static auto real = SdkImport("__imp__XMsgStartIORequest");
   real(ctx, base);
 }

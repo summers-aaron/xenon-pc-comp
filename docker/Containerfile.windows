@@ -1,0 +1,17 @@
+# Cross-compiles the Windows build (clang + lld, MSVC ABI). TARGET_ARCH is the
+# xwin arch of the build: x86_64 or aarch64; tag the image
+# xenon-build-win-<TARGET_ARCH>.
+# The MSVC CRT and Windows SDK come from Microsoft via xwin; building this
+# image accepts Microsoft's license for them.
+FROM registry.fedoraproject.org/fedora:44
+RUN dnf -y install clang lld llvm cmake ninja-build git python3 which findutils \
+    glslang spirv-tools && dnf clean all
+ARG XWIN_VERSION=0.10.0
+ARG TARGET_ARCH=aarch64
+RUN host=$(uname -m) \
+ && curl -fsSL https://github.com/Jake-Shadle/xwin/releases/download/${XWIN_VERSION}/xwin-${XWIN_VERSION}-${host}-unknown-linux-musl.tar.gz \
+      | tar -xz -C /usr/local/bin --strip-components=1 xwin-${XWIN_VERSION}-${host}-unknown-linux-musl/xwin \
+ && xwin --accept-license --arch ${TARGET_ARCH} splat --output /opt/xwin \
+ && rm -rf .xwin-cache
+# The Linux rexglue (codegen runs during the game build) links these.
+RUN dnf -y install libX11 libX11-xcb libxcb libwayland-client && dnf clean all

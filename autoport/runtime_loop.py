@@ -8,11 +8,16 @@ Each iteration:
   4. append `0xX = {}` to that module's config/<stem>_auto.toml
   5. fix_unresolved.py (codegen + tail-merge fixes), gen_xdll_imports.py, rebuild
 Stops when a run ends without a new FATAL address.
+
+With --windows-stage DIR (a /mnt/<drive> path under WSL) the build is a Windows
+cross-build: each iteration copies the .exe/.dlls to DIR and runs them on
+Windows through WSL interop.
 """
 
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -31,6 +36,20 @@ def sh(cmd, log, cwd=None, env=None, timeout=None):
                                   timeout=timeout).returncode
         except subprocess.TimeoutExpired:
             return None
+
+
+def win_path(path):
+    return subprocess.run(["wslpath", "-w", str(path)], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def stage_windows(build_dir, stage):
+    """Copy the executable and DLLs that changed since the last run."""
+    stage.mkdir(parents=True, exist_ok=True)
+    for f in [*build_dir.glob("*.exe"), *build_dir.glob("*.dll")]:
+        dst = stage / f.name
+        if not dst.exists() or dst.stat().st_mtime < f.stat().st_mtime:
+            shutil.copy2(f, dst)
 
 
 def module_for(addr, runlog, manifest):
@@ -74,6 +93,8 @@ def main():
     ap.add_argument("--run-args", default="")
     ap.add_argument("--seconds", type=int, default=60)
     ap.add_argument("--max-iter", type=int, default=25)
+    ap.add_argument("--windows-stage", type=Path,
+                    help="run a Windows build from this directory (WSL path) via interop")
     args = ap.parse_args()
     manifest = args.manifest.resolve()
     root = manifest.parent
@@ -85,10 +106,23 @@ def main():
     env.setdefault("SDL_VIDEODRIVER", "offscreen")  # headless: GPU emulation still runs on Vulkan
 
     for it in range(args.max_iter):
-        runlog = logs / f"run{it}.log"
-        runlog.unlink(missing_ok=True)
-        rc = sh([str(args.build_dir / args.exe), f"--log_file={runlog}", *args.run_args.split()],
-                logs / f"run{it}.out", cwd=args.build_dir, env=env, timeout=args.seconds)
+        if args.windows_stage:
+            stage = args.windows_stage
+            stage_windows(args.build_dir, stage)
+            (stage / "autoport-logs").mkdir(exist_ok=True)
+            runlog = stage / "autoport-logs" / f"run{it}.log"
+            runlog.unlink(missing_ok=True)
+            exe = stage / args.exe
+            rc = sh([str(exe), f"--log_file={win_path(runlog)}", *args.run_args.split()],
+                    logs / f"run{it}.out", cwd=stage, timeout=args.seconds)
+            if rc is None:  # the interop proxy is gone, the Windows process is not
+                subprocess.run(["taskkill.exe", "/F", "/T", "/IM", exe.name],
+                               capture_output=True)
+        else:
+            runlog = logs / f"run{it}.log"
+            runlog.unlink(missing_ok=True)
+            rc = sh([str(args.build_dir / args.exe), f"--log_file={runlog}", *args.run_args.split()],
+                    logs / f"run{it}.out", cwd=args.build_dir, env=env, timeout=args.seconds)
         text = runlog.read_text(errors="replace") if runlog.exists() else ""
         fatals = RE_FATAL.findall(text)
         if not fatals:
@@ -112,8 +146,9 @@ def main():
         if sh(["bash", "-c", args.build_cmd], logs / f"build{it}.log", cwd=root):
             print(f"[iter {it}] build failed; see {logs / f'build{it}.log'}")
             return 1
-        subprocess.run(["bash", "-c", "for f in lib*.so; do n=${f#lib}; ln -sf $f ${n%.so}; done"],
-                       cwd=args.build_dir)
+        if not args.windows_stage:
+            subprocess.run(["bash", "-c", "for f in lib*.so; do n=${f#lib}; ln -sf $f ${n%.so}; done"],
+                           cwd=args.build_dir)
     return 1
 
 
